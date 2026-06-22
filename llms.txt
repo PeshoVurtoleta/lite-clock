@@ -1,0 +1,244 @@
+# @zakkster/lite-clock
+
+Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray
+lane pool. Deterministic `advance(dt)` -- the only mutation entry point.
+Single force-propagate frame signal carrying simTime; lane reads pull values
+directly from TypedArrays so 10K lanes cost one signal write per tick.
+
+Single-file ESM, ~480 LOC, MIT, zero runtime deps, peer dep `lite-signal ^1.2.0`.
+
+## Install
+
+    npm install @zakkster/lite-clock @zakkster/lite-signal
+
+## Imports
+
+    import { createClock, LiteClockCapacityError } from "@zakkster/lite-clock";
+
+## Exports
+
+### `createClock(config?)`
+
+Factory. Returns a frozen `Clock` instance.
+
+Config (all optional):
+- `capacity: number` -- initial pool size. Default 1024, max 65534. Must be a
+  positive integer.
+- `growable: boolean` -- when true, the pool doubles on exhaustion (up to
+  65534). Default false (throws).
+
+Validation throws `TypeError` (shape) / `RangeError` (value) up front.
+
+### `clock.advance(dt: number): void`
+
+The ONLY mutation entry point. Validates `Number.isFinite(dt) && dt >= 0`
+(throws `RangeError` otherwise). `dt=0` still increments `ticks` and
+force-propagates the frame signal so subscribers observe the call.
+
+Tick phases:
+1. Validate dt
+2. simTime += dt; tickCount++
+3. In-place active-list compaction: iterate activeList, write positions back
+   for survivors, queue completedIds for end-of-tick drain
+4. `frameSig.set(simTime)` -- force-propagate (equals: () => false)
+5. Drain onComplete queue (callbacks fire AFTER signal propagation)
+
+Re-entrant: onComplete callbacks may call any clock method, including
+advance(), lane(), etc. The active loop has finished by callback time.
+
+### `clock.advanceTo(t: number): void`
+
+Advance simTime to absolute `t`. Throws if `t < simTime`. `t === simTime` is
+a no-op tick (dt=0 behavior).
+
+### `clock.lane(opts): Lane`
+
+Allocate a new lane from the pool.
+
+Opts:
+- `duration: number` -- > 0, in sim-time units (typically ms)
+- `onComplete?: () => void` -- fires once in the end-of-tick queue
+
+Throws `LiteClockCapacityError` if the pool is exhausted and `growable: false`.
+
+### `Lane` (handle)
+
+Methods:
+- `start()` -- begin advancing (or resume from a pause). Idempotent.
+- `pause()` -- stop advancing; snapshots `positions[id] = elapsed`. Idempotent.
+- `reverse()` -- toggle direction-of-reporting for position()/t(). Idempotent.
+- `dispose()` -- free the slot back to the pool. Idempotent. Subsequent method
+  calls on the handle are silent no-ops.
+
+Reads (tracked -- register dependency on the clock's frame signal):
+- `position(): number` -- sim-time units, [0..duration]
+- `t(): number` -- normalized [0..1]
+- `done(): boolean`
+
+Reads (untracked):
+- `positionPeek(): number`
+- `tPeek(): number`
+- `donePeek(): boolean`
+
+Reverse mode: the engine advances `elapsed` forward always. `reverse()` flips
+what `position()`/`t()`/peek variants return. Completion fires on forward
+`elapsed >= duration` regardless of reverse flag -- a reversed lane "rewinds
+to start" and completes at `t === 0`.
+
+### `clock.frame: FrameAccessor`
+
+`ReadSignal`-shaped accessor for simTime:
+- `clock.frame(): number` -- tracked
+- `clock.frame.peek(): number`
+- `clock.frame.subscribe(fn): Dispose`
+
+Force-propagates on every advance (even dt=0).
+
+### `clock.attachRAF(): void`
+
+Drive from `requestAnimationFrame`. Computes dt from the rAF timestamp.
+Throws if rAF is not available (e.g. plain Node).
+
+### `clock.attachInterval(ms: number): void`
+
+Drive from `setInterval`. Computes dt from `performance.now()` between fires.
+Node-side handles are `.unref()`'d so they don't block process exit.
+
+### `clock.detach(): void`
+
+Cancel any attached tick source. Idempotent.
+
+Each attach call replaces any prior attach.
+
+### `clock.dispose(): void`
+
+Returns the frame signal's node to the lite-signal pool, detaches any
+attached tick source, and resets the lane pool. Idempotent.
+
+**Required** for bounded-lifetime clocks (per route, per level, per
+component mount) -- without it every `createClock()`/`dispose()` cycle leaks
+one slot from the lite-signal default registry and the 1024th cycle hits
+`CapacityError`.
+
+### `clock.simTime: number` (read-only)
+### `clock.ticks: number` (read-only)
+### `clock.capacity: number` (read-only)
+### `clock.activeCount: number` (read-only)
+
+Plain getters. Not signals -- if you need reactivity, track `clock.frame()`.
+
+### `LiteClockCapacityError`
+
+Extends `Error`. Thrown by `clock.lane()` on pool exhaustion. Carries:
+- `name: "LiteClockCapacityError"`
+- `capacity: number` -- the pool size that was exhausted
+
+Message names both escape hatches (`{ capacity: N }` and `{ growable: true }`).
+
+## Key invariants
+
+- `advance(dt)` is the only mutation entry point. dt validation is up-front;
+  the hot loop has no per-iter validation.
+- One force-propagate frame signal per clock. Lane reads pull from TypedArrays
+  routed through clock getters (so growth-relocated arrays are transparent
+  to live LaneHandle instances).
+- In-place active-list compaction. Completed lanes drop out without a second
+  pass.
+- Frame signal propagates BEFORE onComplete callbacks fire. Effects tracking
+  `lane.done()` see `true` BEFORE the callback runs.
+- Re-entrant safe: onComplete callbacks may call any clock method.
+- Pool is LIFO (free list is a stack). Most-recently-disposed slot is reused
+  first.
+- Reverse only affects reporting. Engine always advances elapsed forward.
+- Pool exhaustion throws by default; `growable: true` doubles up to 65534.
+- `clock.dispose()` is required for bounded-lifetime clocks (releases the
+  frame signal node back to the lite-signal pool).
+
+## Common patterns
+
+### DOM animation driven by a lane
+
+    import { effect } from "@zakkster/lite-signal";
+    import { createClock } from "@zakkster/lite-clock";
+
+    const clock = createClock();
+    clock.attachRAF();
+
+    const lane = clock.lane({ duration: 300 });
+    effect(() => { el.style.opacity = lane.t(); });
+    lane.start();
+
+### Chained transitions via onComplete
+
+    const fade = clock.lane({
+        duration: 200,
+        onComplete: () => {
+            const next = clock.lane({ duration: 300, onComplete: finish });
+            next.start();
+        }
+    });
+    fade.start();
+
+### Deterministic test playback
+
+    const clock = createClock();
+    const lane = clock.lane({ duration: 100 });
+    lane.start();
+    [16.67, 33.33, 16.67, 8.33].forEach((dt) => clock.advance(dt));
+    // simTime, position, done are 100% reproducible.
+
+### Multi-clock for isolated subsystems
+
+    const ui  = createClock(); ui.attachRAF();          // 60fps animations
+    const sim = createClock(); sim.attachInterval(8);   // 125Hz physics
+
+### Composition with lite-statechart
+
+    const clock = createClock(); clock.attachRAF();
+    let pulse;
+    const machine = createStatechart({
+        initial: "idle",
+        states: {
+            idle:    { entry: () => pulse?.dispose(), on: { START: "active" } },
+            active:  {
+                entry: () => {
+                    pulse = clock.lane({
+                        duration: 1000,
+                        onComplete: () => machine.send("DONE")
+                    });
+                    pulse.start();
+                },
+                on: { STOP: "idle", DONE: "idle" }
+            }
+        }
+    });
+
+## What this is NOT
+
+- Not a tween library (no easing curves -- compose with `lite-ease`)
+- Not a state machine (compose with `lite-statechart`)
+- Not async (no promises, no microtasks)
+- Not a renderer (only computes lane positions)
+- Not a scheduler with priorities (all lanes advance at the clock's rate)
+
+## Deterministic testing
+
+`advance(dt)` is the sole mutation entry point. Inject any dt sequence twice
+in two fresh clocks and you get identical state. `attachRAF` and
+`attachInterval` are convenience wrappers that compute dt from real time and
+call `advance()`; tests should use `advance()` directly.
+
+## Files
+
+- `Clock.js` -- implementation (~480 lines, ESM)
+- `Clock.d.ts` -- TypeScript declarations
+- `test/01..11` -- behavior, GC, dispose-leak regression suites
+- `bench/bench.mjs` -- six-scenario throughput + retention measurement
+- `README.md` -- full architecture + integration recipes
+- `CHANGELOG.md` -- versioned change log
+- `ROADMAP.md` -- deferred features and rationale
+
+## Author
+
+Zahary Shinikchiev <shinikchiev@yahoo.com>
+MIT License

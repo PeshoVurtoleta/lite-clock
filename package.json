@@ -1,0 +1,74 @@
+{
+  "name": "@zakkster/lite-clock",
+  "version": "1.0.0",
+  "description": "Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray lane pool, deterministic advance(dt), single frame signal carrying simTime. Hits 10K concurrent lanes with zero per-frame allocation.",
+  "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
+  "license": "MIT",
+  "type": "module",
+  "main": "./Clock.js",
+  "module": "./Clock.js",
+  "types": "./Clock.d.ts",
+  "exports": {
+    ".": {
+      "node": "./Clock.js",
+      "import": "./Clock.js",
+      "types": "./Clock.d.ts",
+      "default": "./Clock.js"
+    }
+  },
+  "files": [
+    "Clock.js",
+    "Clock.d.ts",
+    "README.md",
+    "llms.txt",
+    "LICENSE.txt",
+    "CHANGELOG.md",
+    "ROADMAP.md"
+  ],
+  "scripts": {
+    "test": "node --test --test-reporter=spec",
+    "test:gc": "node --expose-gc --test --test-reporter=spec",
+    "bench": "node --expose-gc bench/bench.mjs",
+    "verify": "npm test && npm run test:gc && npm run bench"
+  },
+  "keywords": [
+    "clock",
+    "timeline",
+    "animation",
+    "simulation",
+    "scheduler",
+    "deterministic",
+    "signal",
+    "signals",
+    "reactive",
+    "zero-gc",
+    "zero-allocation",
+    "soa",
+    "typed-array",
+    "esm",
+    "no-dependencies"
+  ],
+  "homepage": "https://github.com/PeshoVurtoleta/lite-clock#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-clock.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-clock/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "sideEffects": false,
+  "peerDependencies": {
+    "@zakkster/lite-signal": "^1.2.2"
+  },
+  "devDependencies": {
+    "@zakkster/lite-signal": "^1.2.2"
+  }
+}

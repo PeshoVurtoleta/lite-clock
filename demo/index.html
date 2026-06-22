@@ -1,0 +1,1519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>@zakkster/lite-clock -- oscilloscope demo</title>
+    <style>
+        :root {
+            --bg: #000;
+            --bg: oklch(0% 0 0);
+            --bg-panel: #0a120a;
+            --bg-panel: oklch(15% 0.02 145);
+            --fg: #00ff41;
+            --fg: oklch(85% 0.28 145);
+            --fg-dim: #007a1f;
+            --fg-dim: oklch(45% 0.16 145);
+            --fg-bright: #c8ffd4;
+            --fg-bright: oklch(96% 0.08 145);
+            --fg-text: #6aff8f;
+            --fg-text: oklch(82% 0.20 145);
+            --warn: #ffb000;
+            --warn: oklch(80% 0.18 75);
+            --error: #ff3050;
+            --error: oklch(65% 0.25 25);
+            --accent: #50d9ff;
+            --accent: oklch(78% 0.14 220);
+            --grid-line: rgba(0, 255, 65, 0.08);
+
+            --r-1: 0.25rem;
+            --r-2: 0.5rem;
+            --r-3: 0.75rem;
+            --r-4: 1rem;
+            --r-5: 1.25rem;
+            --r-6: 1.5rem;
+            --r-8: 2rem;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        html, body {
+            background: var(--bg);
+            color: var(--fg-text);
+            font-family: "SF Mono", "Menlo", "Consolas", "Liberation Mono", monospace;
+            font-size: 0.8125rem;
+            line-height: 1.5;
+            min-height: 100 dvh;
+            background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
+            linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
+            background-size: 1.5rem 1.5rem;
+        }
+
+        header {
+            padding: var(--r-6) var(--r-8) var(--r-4);
+            border-bottom: 1px solid var(--fg-dim);
+            background: var(--bg-panel);
+        }
+
+        header h1 {
+            color: var(--fg-bright);
+            font-size: 1.125rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            text-transform: lowercase;
+        }
+
+        header h1::before {
+            content: ">> ";
+            color: var(--fg);
+        }
+
+        header .tagline {
+            color: var(--fg-dim);
+            font-size: 0.6875rem;
+            margin-top: var(--r-1);
+            letter-spacing: 0.05em;
+        }
+
+        nav#tabs {
+            display: flex;
+            gap: 0;
+            background: var(--bg-panel);
+            border-bottom: 1px solid var(--fg-dim);
+            padding: 0 var(--r-8);
+        }
+
+        nav#tabs button {
+            background: transparent;
+            color: var(--fg-dim);
+            border: none;
+            border-bottom: 2px solid transparent;
+            padding: var(--r-3) var(--r-5);
+            font: inherit;
+            cursor: pointer;
+            letter-spacing: 0.02em;
+            transition: color 80ms, border-color 80ms;
+        }
+
+        nav#tabs button.active {
+            color: var(--fg-bright);
+            border-bottom-color: var(--fg);
+        }
+
+        main {
+            padding: var(--r-6) var(--r-8);
+            max-width: 80rem;
+            margin: 0 auto;
+        }
+
+        .scene {
+            display: none;
+        }
+
+        .scene.active {
+            display: block;
+        }
+
+        .scene-header {
+            display: flex;
+            align-items: baseline;
+            justify-content: space-between;
+            margin-bottom: var(--r-5);
+            gap: var(--r-4);
+        }
+
+        .scene-header h2 {
+            color: var(--fg-bright);
+            font-size: 0.9375rem;
+            font-weight: 600;
+            letter-spacing: 0.02em;
+        }
+
+        .scene-blurb {
+            color: var(--fg-dim);
+            font-size: 0.6875rem;
+            max-width: 34rem;
+            text-align: right;
+        }
+
+        .layout {
+            display: grid;
+            grid-template-columns: 1fr 20rem;
+            gap: var(--r-5);
+            margin-bottom: var(--r-5);
+        }
+
+        @media (width < 60rem
+
+        ) {
+            .layout {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--bg-panel);
+            border: 1px solid var(--fg-dim);
+            border-radius: var(--r-1);
+            padding: var(--r-4);
+            position: relative;
+        }
+
+        .panel::before {
+            content: attr(data-label);
+            position: absolute;
+            top: -0.4375rem;
+            left: var(--r-3);
+            background: var(--bg);
+            color: var(--fg);
+            font-size: 0.625rem;
+            padding: 0 var(--r-2);
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .viz-panel {
+            min-height: 24rem;
+        }
+
+        .viz-panel svg {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
+
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: var(--r-1);
+        }
+
+        button.dispatch {
+            background: transparent;
+            color: var(--fg-text);
+            border: 1px solid var(--fg-dim);
+            padding: var(--r-2) var(--r-3);
+            text-align: left;
+            font: inherit;
+            cursor: pointer;
+            letter-spacing: 0.02em;
+            transition: background 80ms, border-color 80ms, color 80ms;
+            border-radius: 2px;
+        }
+
+        button.dispatch.warn {
+            border-color: var(--warn);
+            color: var(--warn);
+        }
+
+        button.dispatch.error {
+            border-color: var(--error);
+            color: var(--error);
+        }
+
+        button.dispatch.accent {
+            border-color: var(--accent);
+            color: var(--accent);
+        }
+
+        button.dispatch:is([disabled]) {
+            opacity: 0.35;
+            cursor: not-allowed;
+        }
+
+        @media (hover: hover) {
+            nav#tabs button:hover {
+                color: var(--fg-text);
+            }
+
+            button.dispatch:not([disabled]):hover {
+                border-color: var(--fg);
+                color: var(--fg-bright);
+                background: oklch(85% 0.28 145 / 0.06);
+            }
+
+            button.dispatch.warn:not([disabled]):hover {
+                background: oklch(80% 0.18 75 / 0.08);
+            }
+
+            button.dispatch.error:not([disabled]):hover {
+                background: oklch(65% 0.25 25 / 0.08);
+            }
+
+            button.dispatch.accent:not([disabled]):hover {
+                background: oklch(78% 0.14 220 / 0.08);
+            }
+
+            .log-header button:hover {
+                color: var(--fg);
+                border-color: var(--fg);
+            }
+
+            footer a:hover {
+                color: var(--fg-bright);
+            }
+        }
+
+        button.dispatch:not([disabled]):active {
+            background: oklch(85% 0.28 145 / 0.16);
+        }
+
+        .readout {
+            font-size: 0.6875rem;
+            color: var(--fg-dim);
+            display: grid;
+            grid-template-columns: 1fr auto;
+            gap: var(--r-1) var(--r-3);
+            padding: var(--r-3) 0;
+            border-top: 1px dashed var(--fg-dim);
+            margin-top: var(--r-3);
+        }
+
+        .readout dt {
+            color: var(--fg-dim);
+        }
+
+        .readout dd {
+            color: var(--fg-bright);
+            font-weight: 500;
+            text-align: right;
+        }
+
+        .log {
+            background: var(--bg);
+            border: 1px solid var(--fg-dim);
+            border-radius: var(--r-1);
+            padding: var(--r-3);
+            font-size: 0.6875rem;
+            max-height: 16rem;
+            overflow-y: auto;
+            font-family: inherit;
+        }
+
+        .log-row {
+            padding: 2px 0;
+            color: var(--fg-text);
+        }
+
+        .log-row .ts {
+            color: var(--fg-dim);
+            margin-right: var(--r-2);
+        }
+
+        .log-row .ev {
+            color: var(--accent);
+        }
+
+        .log-row .hl {
+            color: var(--fg-bright);
+        }
+
+        .log-row:is(.warn) {
+            color: var(--warn);
+        }
+
+        .log-row:is(.done) {
+            color: var(--fg);
+        }
+
+        .log-row:is(.info) {
+            color: var(--fg-dim);
+            font-style: italic;
+        }
+
+        .log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: var(--r-2);
+        }
+
+        .log-header h3 {
+            color: var(--fg-bright);
+            font-size: 0.75rem;
+            font-weight: 600;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+        }
+
+        .log-header button {
+            background: transparent;
+            color: var(--fg-dim);
+            border: 1px solid var(--fg-dim);
+            padding: 2px var(--r-2);
+            font: inherit;
+            font-size: 0.625rem;
+            cursor: pointer;
+            border-radius: 2px;
+        }
+
+        /* SVG timeline elements */
+        .lane-row .lane-bg {
+            fill: var(--bg);
+            stroke: var(--fg-dim);
+            stroke-width: 1;
+        }
+
+        .lane-row .lane-fill {
+            fill: var(--fg);
+            opacity: 0.7;
+        }
+
+        .lane-row:is(.paused) .lane-fill {
+            fill: var(--fg-dim);
+        }
+
+        .lane-row:is(.reversed) .lane-fill {
+            fill: var(--warn);
+        }
+
+        .lane-row:is(.done) .lane-fill {
+            fill: var(--fg-bright);
+        }
+
+        .lane-row .lane-label {
+            fill: var(--fg-text);
+            font-family: inherit;
+            font-size: 0.6875rem;
+            dominant-baseline: central;
+        }
+
+        .lane-row .lane-meta {
+            fill: var(--fg-dim);
+            font-family: inherit;
+            font-size: 0.5625rem;
+            dominant-baseline: central;
+            text-anchor: end;
+        }
+
+        /* Scene 2: deterministic stepping */
+        .dt-sequence {
+            display: flex;
+            flex-wrap: wrap;
+            gap: var(--r-1);
+            margin-top: var(--r-3);
+        }
+
+        .dt-sequence .dt-pill {
+            background: var(--bg);
+            border: 1px solid var(--fg-dim);
+            color: var(--fg-text);
+            padding: var(--r-1) var(--r-2);
+            font-size: 0.625rem;
+            border-radius: 2px;
+            letter-spacing: 0.02em;
+        }
+
+        .dt-sequence .dt-pill:is(.played) {
+            color: var(--fg);
+            border-color: var(--fg);
+            background: oklch(85% 0.28 145 / 0.08);
+        }
+
+        .dt-sequence .dt-pill:is(.current) {
+            color: var(--fg-bright);
+            border-color: var(--fg-bright);
+            background: oklch(85% 0.28 145 / 0.18);
+            font-weight: 600;
+        }
+
+        /* Scene 3: lifecycle */
+        .lifecycle-bar {
+            margin-top: var(--r-3);
+            height: 2.5rem;
+            background: var(--bg);
+            border: 1px solid var(--fg-dim);
+            border-radius: 2px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .lifecycle-fill {
+            position: absolute;
+            top: 0;
+            left: 0;
+            bottom: 0;
+            background: var(--fg);
+            opacity: 0.7;
+            transition: none;
+            width: 0;
+        }
+
+        .lifecycle-bar:is(.paused) .lifecycle-fill {
+            background: var(--fg-dim);
+        }
+
+        .lifecycle-bar:is(.reversed) .lifecycle-fill {
+            background: var(--warn);
+        }
+
+        .lifecycle-bar:is(.done) .lifecycle-fill {
+            background: var(--fg-bright);
+        }
+
+        .lifecycle-tick {
+            position: absolute;
+            top: 0;
+            bottom: 0;
+            width: 1px;
+            background: var(--fg-bright);
+            pointer-events: none;
+            opacity: 0.4;
+        }
+
+        .flag-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: var(--r-2);
+            margin-top: var(--r-3);
+        }
+
+        .flag-cell {
+            background: var(--bg);
+            border: 1px solid var(--fg-dim);
+            padding: var(--r-2);
+            text-align: center;
+            border-radius: 2px;
+            font-size: 0.625rem;
+            letter-spacing: 0.1em;
+            color: var(--fg-dim);
+            text-transform: uppercase;
+        }
+
+        .flag-cell:is(.on) {
+            color: var(--fg-bright);
+            border-color: var(--fg);
+        }
+
+        /* Scene 4: stress */
+        .stress-counter {
+            font-size: 2.25rem;
+            color: var(--fg-bright);
+            font-weight: 600;
+            font-family: inherit;
+            letter-spacing: 0.02em;
+        }
+
+        .stress-caption {
+            color: var(--fg-dim);
+            font-size: 0.6875rem;
+            letter-spacing: 0.1em;
+            margin-top: 2px;
+        }
+
+        .stress-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+            gap: var(--r-4);
+            margin-top: var(--r-4);
+        }
+
+        .stress-tile {
+            background: var(--bg);
+            border: 1px solid var(--fg-dim);
+            padding: var(--r-3) 0.875rem;
+            border-radius: 3px;
+        }
+
+        .stress-tile .label {
+            font-size: 0.5625rem;
+            color: var(--fg-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: var(--r-1);
+        }
+
+        .stress-tile .value {
+            font-size: 1.125rem;
+            color: var(--fg-bright);
+            font-weight: 600;
+        }
+
+        .stress-tile .unit {
+            font-size: 0.625rem;
+            color: var(--fg-dim);
+            margin-left: var(--r-1);
+        }
+
+        .toggle-row {
+            display: flex;
+            gap: var(--r-2);
+            margin-top: var(--r-3);
+        }
+
+        .toggle-row button {
+            flex: 1;
+            background: transparent;
+            border: 1px solid var(--fg-dim);
+            color: var(--fg-text);
+            padding: var(--r-3);
+            font: inherit;
+            cursor: pointer;
+            border-radius: 2px;
+            letter-spacing: 0.05em;
+        }
+
+        .toggle-row button:is(.start) {
+            border-color: var(--fg);
+            color: var(--fg-bright);
+        }
+
+        .toggle-row button:is(.stop) {
+            border-color: var(--error);
+            color: var(--error);
+        }
+
+        @media (hover: hover) {
+            .toggle-row button:hover {
+                background: oklch(85% 0.28 145 / 0.06);
+            }
+        }
+
+        .stress-note {
+            color: var(--fg-dim);
+            font-size: 0.625rem;
+            margin-top: 0.875rem;
+            line-height: 1.6;
+        }
+
+        code {
+            font-family: inherit;
+            font-size: 0.6875rem;
+            background: var(--bg);
+            color: var(--fg-bright);
+            padding: 1px 0.3125rem;
+            border-radius: 2px;
+        }
+
+        .histogram svg .hist-bar {
+            fill: var(--fg);
+            opacity: 0.7;
+        }
+
+        .histogram svg .hist-axis {
+            stroke: var(--fg-dim);
+            stroke-width: 1;
+        }
+
+        .histogram svg .hist-label {
+            fill: var(--fg-dim);
+            font-size: 0.5625rem;
+            font-family: inherit;
+        }
+
+        footer {
+            padding: var(--r-6) var(--r-8);
+            border-top: 1px solid var(--fg-dim);
+            color: var(--fg-dim);
+            font-size: 0.625rem;
+            margin-top: var(--r-8);
+        }
+
+        footer a {
+            color: var(--fg);
+            text-decoration: none;
+        }
+    </style>
+</head>
+<body>
+
+<header>
+    <h1>@zakkster/lite-clock -- oscilloscope demo</h1>
+    <p class="tagline">four scenes against the real engine -- multi-lane timeline, deterministic stepping, lifecycle,
+        1K-lane stress</p>
+</header>
+
+<nav id="tabs">
+    <button data-scene="timeline" class="active" type="button">[1] timeline</button>
+    <button data-scene="determinism" type="button">[2] deterministic stepping</button>
+    <button data-scene="lifecycle" type="button">[3] lane lifecycle</button>
+    <button data-scene="stress" type="button">[4] 1K-lane stress</button>
+</nav>
+
+<main>
+
+    <!-- ============================ SCENE 1: TIMELINE =========================== -->
+    <section id="scene-timeline" class="scene active">
+        <div class="scene-header">
+            <h2>scene 01 -- multi-lane timeline</h2>
+            <p class="scene-blurb">six lanes with different durations, all driven by one frame signal. effect() per row
+                pushes the new t() into an SVG width attribute. zero per-frame closures.</p>
+        </div>
+
+        <div class="layout">
+            <div class="panel viz-panel" data-label="lane timelines">
+                <svg id="svg-timeline" viewBox="0 0 700 360" aria-label="lane timelines"></svg>
+            </div>
+
+            <div class="panel" data-label="controls">
+                <div class="controls">
+                    <button class="dispatch accent" type="button" id="tl-play">PLAY (rAF)</button>
+                    <button class="dispatch warn" type="button" id="tl-pause">PAUSE</button>
+                    <button class="dispatch" type="button" id="tl-step">STEP (advance 16.67ms)</button>
+                    <button class="dispatch" type="button" id="tl-restart-all">RESTART ALL LANES</button>
+                </div>
+
+                <dl class="readout">
+                    <dt>simTime</dt>
+                    <dd id="tl-sim">0.00 ms</dd>
+                    <dt>ticks</dt>
+                    <dd id="tl-ticks">0</dd>
+                    <dt>active lanes</dt>
+                    <dd id="tl-active">0</dd>
+                    <dt>tick source</dt>
+                    <dd id="tl-src">manual</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="panel" data-label="completion log">
+            <div class="log-header">
+                <h3>onComplete callbacks</h3>
+                <button type="button" data-clear="timeline">clear</button>
+            </div>
+            <div class="log" id="log-timeline"></div>
+        </div>
+    </section>
+
+    <!-- ======================== SCENE 2: DETERMINISTIC STEPPING ================= -->
+    <section id="scene-determinism" class="scene">
+        <div class="scene-header">
+            <h2>scene 02 -- deterministic stepping</h2>
+            <p class="scene-blurb">step through a fixed dt sequence one tick at a time. Replay disposes the clock and
+                re-runs the same sequence; the final state is identical to the bit.</p>
+        </div>
+
+        <div class="layout">
+            <div class="panel viz-panel" data-label="lane state">
+                <svg id="svg-determinism" viewBox="0 0 700 200" aria-label="deterministic lane state"></svg>
+                <div class="dt-sequence" id="dt-pills"></div>
+            </div>
+
+            <div class="panel" data-label="controls">
+                <div class="controls">
+                    <button class="dispatch accent" type="button" id="det-step">STEP NEXT dt</button>
+                    <button class="dispatch" type="button" id="det-step-all">RUN ALL</button>
+                    <button class="dispatch warn" type="button" id="det-replay">REPLAY (recreate clock)</button>
+                    <button class="dispatch" type="button" id="det-reset">RESET</button>
+                </div>
+
+                <dl class="readout">
+                    <dt>simTime</dt>
+                    <dd id="det-sim">0.00 ms</dd>
+                    <dt>dt index</dt>
+                    <dd id="det-idx">0 / 8</dd>
+                    <dt>lane position</dt>
+                    <dd id="det-pos">0.00</dd>
+                    <dt>lane t</dt>
+                    <dd id="det-t">0.0000</dd>
+                    <dt>lane done</dt>
+                    <dd id="det-done">false</dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="panel" data-label="event log">
+            <div class="log-header">
+                <h3>step log (compare across runs)</h3>
+                <button type="button" data-clear="determinism">clear</button>
+            </div>
+            <div class="log" id="log-determinism"></div>
+        </div>
+    </section>
+
+    <!-- ============================ SCENE 3: LIFECYCLE ========================== -->
+    <section id="scene-lifecycle" class="scene">
+        <div class="scene-header">
+            <h2>scene 03 -- lane lifecycle</h2>
+            <p class="scene-blurb">single 4-second lane. start, pause, reverse, dispose. reverse only flips reporting
+                (color changes amber); engine still advances elapsed forward.</p>
+        </div>
+
+        <div class="layout">
+            <div class="panel" data-label="lane state">
+                <div id="lifecycle-bar" class="lifecycle-bar">
+                    <div id="lifecycle-fill" class="lifecycle-fill"></div>
+                </div>
+
+                <div class="flag-grid">
+                    <div class="flag-cell" id="flag-alloc">ALLOC</div>
+                    <div class="flag-cell" id="flag-active">ACTIVE</div>
+                    <div class="flag-cell" id="flag-reverse">REVERSE</div>
+                    <div class="flag-cell" id="flag-done">DONE</div>
+                </div>
+
+                <dl class="readout">
+                    <dt>simTime</dt>
+                    <dd id="lc-sim">0.00 ms</dd>
+                    <dt>position</dt>
+                    <dd id="lc-pos">0.00</dd>
+                    <dt>t</dt>
+                    <dd id="lc-t">0.0000</dd>
+                    <dt>done</dt>
+                    <dd id="lc-done">false</dd>
+                </dl>
+            </div>
+
+            <div class="panel" data-label="controls">
+                <div class="controls">
+                    <button class="dispatch accent" type="button" id="lc-start">START</button>
+                    <button class="dispatch warn" type="button" id="lc-pause">PAUSE</button>
+                    <button class="dispatch" type="button" id="lc-reverse">REVERSE</button>
+                    <button class="dispatch error" type="button" id="lc-dispose">DISPOSE</button>
+                    <button class="dispatch" type="button" id="lc-fresh">FRESH LANE (4s)</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel" data-label="event log">
+            <div class="log-header">
+                <h3>lifecycle events</h3>
+                <button type="button" data-clear="lifecycle">clear</button>
+            </div>
+            <div class="log" id="log-lifecycle"></div>
+        </div>
+    </section>
+
+    <!-- ============================== SCENE 4: STRESS =========================== -->
+    <section id="scene-stress" class="scene">
+        <div class="scene-header">
+            <h2>scene 04 -- 1K active lanes</h2>
+            <p class="scene-blurb">1000 lanes with randomized durations all running together. histogram below shows
+                t-distribution updated every 8 frames. zero-alloc telemetry: Float64Array ring buffer, ~10Hz throttled
+                text.</p>
+        </div>
+
+        <div class="panel" data-label="counters">
+            <div class="stress-counter" id="stress-rate">0</div>
+            <div class="stress-caption">ticks per second (rolling 1s)</div>
+
+            <div class="stress-grid">
+                <div class="stress-tile">
+                    <div class="label">active lanes</div>
+                    <div class="value" id="stress-active">0</div>
+                </div>
+                <div class="stress-tile">
+                    <div class="label">total ticks</div>
+                    <div class="value" id="stress-ticks">0</div>
+                </div>
+                <div class="stress-tile">
+                    <div class="label">total completed</div>
+                    <div class="value" id="stress-completed">0</div>
+                </div>
+                <div class="stress-tile">
+                    <div class="label">heap delta</div>
+                    <div class="value" id="stress-heap">--</div>
+                </div>
+            </div>
+
+            <div class="toggle-row">
+                <button id="stress-start" class="start" type="button">START</button>
+                <button id="stress-stop" class="stop" type="button" disabled>STOP</button>
+            </div>
+
+            <p class="stress-note">
+                The stress harness spawns 1000 lanes with random durations [200ms, 4000ms], drives the clock from rAF,
+                and recycles completed lanes via <code>onComplete</code> so the active count stays steady. Each frame:
+                lane scan + activeList compaction + one frame signal write. Telemetry sampling uses a <code>Float64Array(512)</code>
+                ring buffer (256 paired entries, power-of-2 bitmask <code>& 511</code>), and SVG histogram updates
+                throttle to every 8 frames via <code>(frame &amp; 7) === 0</code>.
+            </p>
+        </div>
+
+        <div class="panel histogram" data-label="t-distribution across 1000 lanes (50 buckets)">
+            <svg id="svg-histogram" viewBox="0 0 700 180" aria-label="t-distribution histogram"></svg>
+        </div>
+    </section>
+
+</main>
+
+<footer>
+    built on <a href="https://www.npmjs.com/package/@zakkster/lite-signal">@zakkster/lite-signal</a> +
+    <a href="https://www.npmjs.com/package/@zakkster/lite-clock">@zakkster/lite-clock</a> --
+    MIT (c) Zahary Shinikchiev -- run from package root with <code>npx serve .</code>
+</footer>
+
+<script type="importmap">
+{
+    "imports": {
+        "@zakkster/lite-signal": "https://esm.sh/@zakkster/lite-signal@1.2.2",
+        "@zakkster/lite-clock":  "../Clock.js"
+    }
+}
+
+</script>
+
+<script type="module">
+    import {effect} from "@zakkster/lite-signal";
+    import {createClock} from "@zakkster/lite-clock";
+
+    // ===========================================================================
+    // Module-level constants
+    // ===========================================================================
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const TAU = Math.PI * 2;
+    const STRESS_LANE_COUNT = 1000;
+    const STRESS_HISTORY_LEN = 512;
+    const STRESS_HISTORY_MASK = STRESS_HISTORY_LEN - 1;
+    const STRESS_TEXT_UPDATE_MASK = 7;
+    const HIST_BUCKETS = 50;
+    const LOG_MAX_ROWS = 200;
+    const TIMELINE_LANE_COUNT = 6;
+    const TIMELINE_DURATIONS = [800, 1200, 1600, 2000, 2400, 3000];
+
+    // ===========================================================================
+    // Cached DOM references
+    // ===========================================================================
+    const $tabs = document.querySelectorAll("#tabs button");
+    const $scenes = document.querySelectorAll(".scene");
+
+    const $logTimeline = document.getElementById("log-timeline");
+    const $logDeterminism = document.getElementById("log-determinism");
+    const $logLifecycle = document.getElementById("log-lifecycle");
+
+    // Timeline
+    const $svgTimeline = document.getElementById("svg-timeline");
+    const $tlPlay = document.getElementById("tl-play");
+    const $tlPause = document.getElementById("tl-pause");
+    const $tlStep = document.getElementById("tl-step");
+    const $tlRestart = document.getElementById("tl-restart-all");
+    const $tlSim = document.getElementById("tl-sim");
+    const $tlTicks = document.getElementById("tl-ticks");
+    const $tlActive = document.getElementById("tl-active");
+    const $tlSrc = document.getElementById("tl-src");
+
+    // Determinism
+    const $svgDet = document.getElementById("svg-determinism");
+    const $dtPills = document.getElementById("dt-pills");
+    const $detStep = document.getElementById("det-step");
+    const $detStepAll = document.getElementById("det-step-all");
+    const $detReplay = document.getElementById("det-replay");
+    const $detReset = document.getElementById("det-reset");
+    const $detSim = document.getElementById("det-sim");
+    const $detIdx = document.getElementById("det-idx");
+    const $detPos = document.getElementById("det-pos");
+    const $detT = document.getElementById("det-t");
+    const $detDone = document.getElementById("det-done");
+
+    // Lifecycle
+    const $lcBar = document.getElementById("lifecycle-bar");
+    const $lcFill = document.getElementById("lifecycle-fill");
+    const $lcStart = document.getElementById("lc-start");
+    const $lcPause = document.getElementById("lc-pause");
+    const $lcReverse = document.getElementById("lc-reverse");
+    const $lcDispose = document.getElementById("lc-dispose");
+    const $lcFresh = document.getElementById("lc-fresh");
+    const $lcSim = document.getElementById("lc-sim");
+    const $lcPos = document.getElementById("lc-pos");
+    const $lcT = document.getElementById("lc-t");
+    const $lcDone = document.getElementById("lc-done");
+    const $flagAlloc = document.getElementById("flag-alloc");
+    const $flagActive = document.getElementById("flag-active");
+    const $flagReverse = document.getElementById("flag-reverse");
+    const $flagDone = document.getElementById("flag-done");
+
+    // Stress
+    const $svgHist = document.getElementById("svg-histogram");
+    const $stressRate = document.getElementById("stress-rate");
+    const $stressActive = document.getElementById("stress-active");
+    const $stressTicks = document.getElementById("stress-ticks");
+    const $stressCompd = document.getElementById("stress-completed");
+    const $stressHeap = document.getElementById("stress-heap");
+    const $stressStart = document.getElementById("stress-start");
+    const $stressStop = document.getElementById("stress-stop");
+
+    const LOG_BY_NAME = {
+        timeline: $logTimeline,
+        determinism: $logDeterminism,
+        lifecycle: $logLifecycle
+    };
+
+    // ===========================================================================
+    // Tab switcher
+    // ===========================================================================
+    function onTabClick(ev) {
+        const target = ev.currentTarget.dataset.scene;
+        const sceneId = "scene-" + target;
+        for (let i = 0; i < $tabs.length; i = (i + 1) | 0) {
+            const t = $tabs[i];
+            t.classList.toggle("active", t === ev.currentTarget);
+        }
+        for (let i = 0; i < $scenes.length; i = (i + 1) | 0) {
+            const s = $scenes[i];
+            s.classList.toggle("active", s.id === sceneId);
+        }
+    }
+
+    for (let i = 0; i < $tabs.length; i = (i + 1) | 0) $tabs[i].addEventListener("click", onTabClick);
+
+    // ===========================================================================
+    // Helpers (user-event-driven, not in hot path)
+    // ===========================================================================
+    function ts() {
+        const d = new Date();
+        return d.toTimeString().slice(0, 8) + "." + String(d.getMilliseconds()).padStart(3, "0");
+    }
+
+    function appendLog(el, html, cls) {
+        const row = document.createElement("div");
+        row.className = cls ? "log-row " + cls : "log-row";
+        row.innerHTML = html;
+        el.appendChild(row);
+        el.scrollTop = el.scrollHeight;
+        let excess = el.children.length - LOG_MAX_ROWS;
+        while (excess > 0) {
+            el.removeChild(el.firstChild);
+            excess = excess - 1;
+        }
+    }
+
+    const clearButtons = document.querySelectorAll("[data-clear]");
+    for (let i = 0; i < clearButtons.length; i = (i + 1) | 0) {
+        const btn = clearButtons[i];
+        const targetEl = LOG_BY_NAME[btn.dataset.clear];
+        if (targetEl !== undefined) btn.addEventListener("click", () => {
+            targetEl.innerHTML = "";
+        });
+    }
+
+    // ===========================================================================
+    // SCENE 1: TIMELINE
+    // ===========================================================================
+    const tlClock = createClock();
+    const tlLanes = new Array(TIMELINE_LANE_COUNT);
+    const tlRowGroups = new Array(TIMELINE_LANE_COUNT);
+    const tlFillRects = new Array(TIMELINE_LANE_COUNT);
+    const tlLabels = new Array(TIMELINE_LANE_COUNT);
+
+    // Build the SVG once at init.
+    const TL_BAR_X = 100;
+    const TL_BAR_W = 540;
+    const TL_ROW_H = 48;
+    const TL_ROW_Y0 = 24;
+
+    function buildTimelineSvg() {
+        for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
+            const y = TL_ROW_Y0 + i * TL_ROW_H;
+            const g = document.createElementNS(SVG_NS, "g");
+            g.setAttribute("class", "lane-row");
+            g.dataset.idx = i;
+
+            const lbl = document.createElementNS(SVG_NS, "text");
+            lbl.setAttribute("x", 12);
+            lbl.setAttribute("y", y + 12);
+            lbl.setAttribute("class", "lane-label");
+            lbl.textContent = "lane " + i + " (" + TIMELINE_DURATIONS[i] + "ms)";
+            g.appendChild(lbl);
+
+            const bg = document.createElementNS(SVG_NS, "rect");
+            bg.setAttribute("x", TL_BAR_X);
+            bg.setAttribute("y", y);
+            bg.setAttribute("width", TL_BAR_W);
+            bg.setAttribute("height", 20);
+            bg.setAttribute("class", "lane-bg");
+            g.appendChild(bg);
+
+            const fill = document.createElementNS(SVG_NS, "rect");
+            fill.setAttribute("x", TL_BAR_X);
+            fill.setAttribute("y", y);
+            fill.setAttribute("width", 0);
+            fill.setAttribute("height", 20);
+            fill.setAttribute("class", "lane-fill");
+            g.appendChild(fill);
+
+            const meta = document.createElementNS(SVG_NS, "text");
+            meta.setAttribute("x", 690);
+            meta.setAttribute("y", y + 12);
+            meta.setAttribute("class", "lane-meta");
+            meta.textContent = "t=0.000";
+            g.appendChild(meta);
+
+            $svgTimeline.appendChild(g);
+            tlRowGroups[i] = g;
+            tlFillRects[i] = fill;
+            tlLabels[i] = meta;
+        }
+    }
+
+    buildTimelineSvg();
+
+    function tlSpawnLane(i) {
+        const dur = TIMELINE_DURATIONS[i];
+        const idx = i;  // closure captures index only
+        const lane = tlClock.lane({
+            duration: dur,
+            onComplete: () => {
+                appendLog($logTimeline,
+                    '<span class="ts">' + ts() + '</span> lane <span class="hl">' + idx + '</span> completed at simTime=' + tlClock.simTime.toFixed(2),
+                    "done");
+                // Auto-respawn so the scene keeps running.
+                tlLanes[idx].dispose();
+                tlLanes[idx] = tlSpawnLane(idx);
+                tlLanes[idx].start();
+            }
+        });
+        return lane;
+    }
+
+    function tlInit() {
+        for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
+            if (tlLanes[i] !== undefined) tlLanes[i].dispose();
+            tlLanes[i] = tlSpawnLane(i);
+            tlLanes[i].start();
+        }
+    }
+
+    tlInit();
+
+    // One effect drives ALL lanes' visuals via the tracked frame signal.
+    effect(() => {
+        tlClock.frame();   // track
+        for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
+            const ln = tlLanes[i];
+            const t = ln.tPeek();
+            tlFillRects[i].setAttribute("width", (t * TL_BAR_W) | 0);
+            tlLabels[i].textContent = "t=" + t.toFixed(3);
+            // Toggle row state class
+            const grp = tlRowGroups[i];
+            if (ln.donePeek()) {
+                if (grp.className.baseVal !== "lane-row done") grp.setAttribute("class", "lane-row done");
+            } else {
+                if (grp.className.baseVal !== "lane-row") grp.setAttribute("class", "lane-row");
+            }
+        }
+        $tlSim.textContent = tlClock.simTime.toFixed(2) + " ms";
+        $tlTicks.textContent = String(tlClock.ticks);
+        $tlActive.textContent = String(tlClock.activeCount);
+    });
+
+    $tlPlay.addEventListener("click", () => {
+        tlClock.attachRAF();
+        $tlSrc.textContent = "requestAnimationFrame";
+    });
+    $tlPause.addEventListener("click", () => {
+        tlClock.detach();
+        $tlSrc.textContent = "manual";
+    });
+    $tlStep.addEventListener("click", () => {
+        tlClock.detach();
+        $tlSrc.textContent = "manual";
+        tlClock.advance(16.67);
+    });
+    $tlRestart.addEventListener("click", () => {
+        tlInit();
+        appendLog($logTimeline, '<span class="ts">' + ts() + '</span> restarted all 6 lanes', "info");
+    });
+
+    // ===========================================================================
+    // SCENE 2: DETERMINISTIC STEPPING
+    // ===========================================================================
+    const DT_SEQUENCE = [16.67, 16.67, 33.33, 16.67, 8.33, 50.00, 16.67, 16.67];
+
+    let detClock = null;
+    let detLane = null;
+    let detIndex = 0;
+    let detRunId = 0;  // increments on each Reset/Replay so log lines tag which run
+
+    // Build dt pills once
+    function buildDtPills() {
+        while ($dtPills.firstChild) $dtPills.removeChild($dtPills.firstChild);
+        for (let i = 0; i < DT_SEQUENCE.length; i = (i + 1) | 0) {
+            const pill = document.createElement("div");
+            pill.className = "dt-pill";
+            pill.dataset.idx = i;
+            pill.textContent = "+" + DT_SEQUENCE[i].toFixed(2) + "ms";
+            $dtPills.appendChild(pill);
+        }
+    }
+
+    function updateDtPills() {
+        const pills = $dtPills.children;
+        for (let i = 0; i < pills.length; i = (i + 1) | 0) {
+            const cls = i < detIndex ? "dt-pill played"
+                : i === detIndex ? "dt-pill current"
+                    : "dt-pill";
+            if (pills[i].className !== cls) pills[i].className = cls;
+        }
+    }
+
+    // Det viz: single horizontal bar
+    function buildDetSvg() {
+        while ($svgDet.firstChild) $svgDet.removeChild($svgDet.firstChild);
+        const bg = document.createElementNS(SVG_NS, "rect");
+        bg.setAttribute("x", 80);
+        bg.setAttribute("y", 60);
+        bg.setAttribute("width", 560);
+        bg.setAttribute("height", 32);
+        bg.setAttribute("class", "lane-bg");
+        $svgDet.appendChild(bg);
+        const fill = document.createElementNS(SVG_NS, "rect");
+        fill.setAttribute("x", 80);
+        fill.setAttribute("y", 60);
+        fill.setAttribute("width", 0);
+        fill.setAttribute("height", 32);
+        fill.setAttribute("class", "lane-fill");
+        fill.setAttribute("id", "det-fill");
+        $svgDet.appendChild(fill);
+        const lbl = document.createElementNS(SVG_NS, "text");
+        lbl.setAttribute("x", 12);
+        lbl.setAttribute("y", 76);
+        lbl.setAttribute("class", "lane-label");
+        lbl.textContent = "lane (200ms)";
+        $svgDet.appendChild(lbl);
+        const meta = document.createElementNS(SVG_NS, "text");
+        meta.setAttribute("x", 80);
+        meta.setAttribute("y", 130);
+        meta.setAttribute("class", "lane-meta");
+        meta.setAttribute("text-anchor", "start");
+        meta.setAttribute("id", "det-svg-meta");
+        meta.textContent = "step 0 / 8";
+        $svgDet.appendChild(meta);
+    }
+
+    buildDetSvg();
+    const $detFill = document.getElementById("det-fill");
+    const $detSvgMeta = document.getElementById("det-svg-meta");
+    const DET_BAR_W = 560;
+
+    function detRender() {
+        const pos = detLane.positionPeek();
+        const t = detLane.tPeek();
+        const done = detLane.donePeek();
+        $detFill.setAttribute("width", (t * DET_BAR_W) | 0);
+        $detSvgMeta.textContent = "step " + detIndex + " / " + DT_SEQUENCE.length;
+        $detSim.textContent = detClock.simTime.toFixed(2) + " ms";
+        $detIdx.textContent = detIndex + " / " + DT_SEQUENCE.length;
+        $detPos.textContent = pos.toFixed(2);
+        $detT.textContent = t.toFixed(4);
+        $detDone.textContent = String(done);
+        updateDtPills();
+    }
+
+    function detResetClock() {
+        if (detClock !== null) detClock.dispose();
+        detClock = createClock();
+        detLane = detClock.lane({duration: 200});
+        detLane.start();
+        detIndex = 0;
+        detRunId = (detRunId + 1) | 0;
+        detRender();
+    }
+
+    function detStepOne() {
+        if (detIndex >= DT_SEQUENCE.length) return;
+        const dt = DT_SEQUENCE[detIndex];
+        detClock.advance(dt);
+        detIndex = (detIndex + 1) | 0;
+        appendLog($logDeterminism,
+            '<span class="ts">run #' + detRunId + ' step ' + (detIndex - 1) + '</span> +' + dt.toFixed(2) + 'ms -> simTime=' + detClock.simTime.toFixed(2) + ' pos=' + detLane.positionPeek().toFixed(2) + ' t=' + detLane.tPeek().toFixed(4) + ' done=' + detLane.donePeek());
+        detRender();
+    }
+
+    buildDtPills();
+    detResetClock();
+
+    $detStep.addEventListener("click", detStepOne);
+    $detStepAll.addEventListener("click", () => {
+        while (detIndex < DT_SEQUENCE.length) detStepOne();
+    });
+    $detReplay.addEventListener("click", () => {
+        appendLog($logDeterminism, '<span class="ts">' + ts() + '</span> --- replay (recreate clock) ---', "info");
+        detResetClock();
+    });
+    $detReset.addEventListener("click", () => {
+        appendLog($logDeterminism, '<span class="ts">' + ts() + '</span> --- reset ---', "info");
+        detResetClock();
+    });
+
+    // ===========================================================================
+    // SCENE 3: LANE LIFECYCLE
+    // ===========================================================================
+    const lcClock = createClock();
+    lcClock.attachRAF();
+    let lcLane = null;
+
+    function lcFresh() {
+        if (lcLane !== null) lcLane.dispose();
+        lcLane = lcClock.lane({
+            duration: 4000,
+            onComplete: () => {
+                appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> onComplete fired', "done");
+            }
+        });
+    }
+
+    lcFresh();
+
+    // Declared before the effect: the effect runs its body synchronously on
+    // creation and reads both of these, so they must already be initialized
+    // (otherwise the first run hits the temporal dead zone and throws).
+    let lcActive = false;
+    let lcReversed = false;
+
+    // Render via effect that tracks the frame signal
+    effect(() => {
+        lcClock.frame();
+        if (lcLane === null) return;
+        const pos = lcLane.positionPeek();
+        const t = lcLane.tPeek();
+        const done = lcLane.donePeek();
+        $lcFill.style.setProperty("width", (t * 100).toFixed(2) + "%");
+        $lcSim.textContent = lcClock.simTime.toFixed(2) + " ms";
+        $lcPos.textContent = pos.toFixed(2);
+        $lcT.textContent = t.toFixed(4);
+        $lcDone.textContent = String(done);
+
+        // We don't have direct access to the FLAG_* bits from the public API; infer them.
+        // ALLOC: lane exists (handle was returned and not yet observed to be invalid)
+        // ACTIVE: not paused and not done -- inferred via the running heuristic in start/pause
+        // REVERSE: tracked via lcReversed below
+        // DONE: lcLane.donePeek()
+        $flagAlloc.classList.toggle("on", true);
+        $flagActive.classList.toggle("on", lcActive);
+        $flagReverse.classList.toggle("on", lcReversed);
+        $flagDone.classList.toggle("on", done);
+        $lcBar.classList.toggle("paused", !lcActive && !done);
+        $lcBar.classList.toggle("reversed", lcReversed && !done);
+        $lcBar.classList.toggle("done", done);
+    });
+
+    $lcStart.addEventListener("click", () => {
+        lcLane.start();
+        lcActive = true;
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> start()');
+    });
+    $lcPause.addEventListener("click", () => {
+        lcLane.pause();
+        lcActive = false;
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> pause()', "warn");
+    });
+    $lcReverse.addEventListener("click", () => {
+        lcLane.reverse();
+        lcReversed = !lcReversed;
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> reverse() -> reversed=' + lcReversed);
+    });
+    $lcDispose.addEventListener("click", () => {
+        lcLane.dispose();
+        lcActive = false;
+        lcReversed = false;
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> dispose()', "warn");
+        $flagAlloc.classList.toggle("on", false);
+    });
+    $lcFresh.addEventListener("click", () => {
+        lcFresh();
+        lcActive = false;
+        lcReversed = false;
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> fresh lane allocated (4000ms duration)', "info");
+    });
+
+    // ===========================================================================
+    // SCENE 4: STRESS (1K LANES)
+    // ===========================================================================
+    const stressClock = createClock({capacity: 1024});
+    const stressLanes = new Array(STRESS_LANE_COUNT);
+    let stressRunning = false;
+    let stressCompleted = 0;
+
+    const stressHistory = new Float64Array(STRESS_HISTORY_LEN);
+    let stressHead = 0;
+    let stressTail = 0;
+    let stressRateSum = 0;
+    let stressFrame = 0;
+    let stressPrevTicks = 0;
+    let stressHasMemoryApi = false;
+    let stressHeapStart = 0;
+
+    // Build histogram SVG once
+    const HIST_X = 30;
+    const HIST_W = 640;
+    const HIST_Y_BOTTOM = 150;
+    const HIST_H = 130;
+    const HIST_BAR_W = (HIST_W / HIST_BUCKETS) - 1;
+    const histBars = new Array(HIST_BUCKETS);
+    const histCounts = new Uint16Array(HIST_BUCKETS);
+
+    function buildHistogramSvg() {
+        // Axis
+        const axis = document.createElementNS(SVG_NS, "line");
+        axis.setAttribute("x1", HIST_X);
+        axis.setAttribute("x2", HIST_X + HIST_W);
+        axis.setAttribute("y1", HIST_Y_BOTTOM);
+        axis.setAttribute("y2", HIST_Y_BOTTOM);
+        axis.setAttribute("class", "hist-axis");
+        $svgHist.appendChild(axis);
+        // X labels
+        for (let m = 0; m <= 4; m = (m + 1) | 0) {
+            const t = document.createElementNS(SVG_NS, "text");
+            t.setAttribute("x", HIST_X + (HIST_W * m / 4));
+            t.setAttribute("y", HIST_Y_BOTTOM + 14);
+            t.setAttribute("class", "hist-label");
+            t.setAttribute("text-anchor", "middle");
+            t.textContent = (m * 0.25).toFixed(2);
+            $svgHist.appendChild(t);
+        }
+        // Bars
+        for (let i = 0; i < HIST_BUCKETS; i = (i + 1) | 0) {
+            const bar = document.createElementNS(SVG_NS, "rect");
+            bar.setAttribute("x", HIST_X + i * (HIST_W / HIST_BUCKETS));
+            bar.setAttribute("y", HIST_Y_BOTTOM);
+            bar.setAttribute("width", HIST_BAR_W);
+            bar.setAttribute("height", 0);
+            bar.setAttribute("class", "hist-bar");
+            $svgHist.appendChild(bar);
+            histBars[i] = bar;
+        }
+        // Title
+        const title = document.createElementNS(SVG_NS, "text");
+        title.setAttribute("x", HIST_X);
+        title.setAttribute("y", 16);
+        title.setAttribute("class", "hist-label");
+        title.textContent = "lanes per t-bucket (0.00 -> 1.00)";
+        $svgHist.appendChild(title);
+    }
+
+    buildHistogramSvg();
+
+    // Pre-bound onComplete so each lane uses the same function reference (no
+    // per-lane closure allocation).
+    function onStressLaneComplete() {
+        stressCompleted = (stressCompleted + 1) | 0;
+    }
+
+    function stressSpawnLane(i) {
+        // Random duration in [200, 4000]
+        const dur = 200 + (Math.random() * 3800);
+        const lane = stressClock.lane({duration: dur, onComplete: onStressLaneComplete});
+        lane.start();
+        stressLanes[i] = lane;
+    }
+
+    function stressSpawnAll() {
+        for (let i = 0; i < STRESS_LANE_COUNT; i = (i + 1) | 0) {
+            if (stressLanes[i] !== undefined) stressLanes[i].dispose();
+            stressSpawnLane(i);
+        }
+    }
+
+    // Respawn-on-complete handler. We poll for done lanes once per frame instead
+    // of recycling inside onComplete (which would call lane() inside the drain
+    // loop -- still safe, but the polling pattern is friendlier to the cache).
+    function stressRecycle() {
+        for (let i = 0; i < STRESS_LANE_COUNT; i = (i + 1) | 0) {
+            if (stressLanes[i].donePeek()) {
+                stressLanes[i].dispose();
+                stressSpawnLane(i);
+            }
+        }
+    }
+
+    function updateHistogram() {
+        // Reset buckets (Uint16Array.fill is native; not user-land alloc).
+        histCounts.fill(0);
+        // Bucketize current t values.
+        for (let i = 0; i < STRESS_LANE_COUNT; i = (i + 1) | 0) {
+            const t = stressLanes[i].tPeek();
+            let b = (t * HIST_BUCKETS) | 0;
+            if (b >= HIST_BUCKETS) b = HIST_BUCKETS - 1;
+            if (b < 0) b = 0;
+            histCounts[b] = (histCounts[b] + 1) | 0;
+        }
+        // Find max for scaling.
+        let max = 1;
+        for (let i = 0; i < HIST_BUCKETS; i = (i + 1) | 0) {
+            if (histCounts[i] > max) max = histCounts[i];
+        }
+        // Update bar heights.
+        for (let i = 0; i < HIST_BUCKETS; i = (i + 1) | 0) {
+            const h = (histCounts[i] * HIST_H / max) | 0;
+            histBars[i].setAttribute("y", HIST_Y_BOTTOM - h);
+            histBars[i].setAttribute("height", h);
+        }
+    }
+
+    function fmtBytes(b) {
+        const sign = b < 0 ? "-" : "";
+        const a = b < 0 ? -b : b;
+        if (a < 1024) return sign + a + " B";
+        if (a < 1048576) return sign + ((a / 1024) | 0) + " KB";
+        return sign + ((a / 10485.76) | 0) / 100 + " MB";
+    }
+
+    function stressTick() {
+        if (!stressRunning) return;
+
+        stressRecycle();
+
+        const t = performance.now();
+        const tickDelta = stressClock.ticks - stressPrevTicks;
+        stressPrevTicks = stressClock.ticks;
+
+        stressHistory[stressHead] = t;
+        stressHistory[stressHead + 1] = tickDelta;
+        stressRateSum = stressRateSum + tickDelta;
+        stressHead = (stressHead + 2) & STRESS_HISTORY_MASK;
+        if (stressHead === stressTail) {
+            stressRateSum = stressRateSum - stressHistory[stressTail + 1];
+            stressTail = (stressTail + 2) & STRESS_HISTORY_MASK;
+        }
+        while (stressTail !== stressHead && (t - stressHistory[stressTail]) > 1000) {
+            stressRateSum = stressRateSum - stressHistory[stressTail + 1];
+            stressTail = (stressTail + 2) & STRESS_HISTORY_MASK;
+        }
+
+        stressFrame = (stressFrame + 1) | 0;
+
+        if ((stressFrame & STRESS_TEXT_UPDATE_MASK) === 0) {
+            $stressRate.textContent = stressRateSum.toLocaleString();
+            $stressActive.textContent = String(stressClock.activeCount);
+            $stressTicks.textContent = stressClock.ticks.toLocaleString();
+            $stressCompd.textContent = stressCompleted.toLocaleString();
+            if (stressHasMemoryApi) {
+                const delta = performance.memory.usedJSHeapSize - stressHeapStart;
+                $stressHeap.textContent = fmtBytes(delta);
+            }
+            updateHistogram();
+        }
+
+        requestAnimationFrame(stressTick);
+    }
+
+    function onStressStart() {
+        stressCompleted = 0;
+        stressSpawnAll();
+        stressClock.attachRAF();
+        stressRunning = true;
+        stressPrevTicks = stressClock.ticks;
+        stressHasMemoryApi = (typeof performance.memory === "object" && performance.memory !== null);
+        if (stressHasMemoryApi) {
+            stressHeapStart = performance.memory.usedJSHeapSize;
+        } else {
+            $stressHeap.textContent = "n/a (Chrome only)";
+        }
+        $stressStart.disabled = true;
+        $stressStop.disabled = false;
+        // Reset telemetry ring
+        stressHead = 0;
+        stressTail = 0;
+        stressRateSum = 0;
+        stressFrame = 0;
+        stressHistory.fill(0);
+        requestAnimationFrame(stressTick);
+    }
+
+    function onStressStop() {
+        stressRunning = false;
+        stressClock.detach();
+        $stressStart.disabled = false;
+        $stressStop.disabled = true;
+    }
+
+    $stressStart.addEventListener("click", onStressStart);
+    $stressStop.addEventListener("click", onStressStop);
+</script>
+
+</body>
+</html>

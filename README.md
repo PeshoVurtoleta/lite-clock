@@ -199,13 +199,13 @@ sequenceDiagram
 
     U->>C: clock.advance(16.67)
     C->>C: validate Number.isFinite(dt) && dt >= 0
-    C->>C: simTime += dt; tickCount++
+    C->>C: simTime += dt, tickCount++
     C->>L: iterate activeList[0..activeCount)
     loop per active lane
         L->>L: elapsed = simTime - startTimes[id]
         alt elapsed >= duration
             L->>L: positions[id] = duration
-            L->>L: flags[id] |= DONE; &= ~ACTIVE
+            L->>L: flags[id] |= DONE, &= ~ACTIVE
             L->>L: completedIds[completedCount++] = id
         else
             L->>L: positions[id] = elapsed

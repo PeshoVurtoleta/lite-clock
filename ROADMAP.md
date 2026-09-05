@@ -487,7 +487,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-clock"
 version_target: 1.1.0
-status: implemented (pipeline complete 2026-09-05; awaiting /release 1.1.0)
+status: shipped (2026-09-05 -- published to npm as 1.1.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -589,7 +589,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-clock"
 version_target: 1.2.0
-status: planned
+status: implemented (pipeline complete 2026-09-05; awaiting /release 1.2.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -973,7 +973,7 @@ deterministic time -- and no number in that list ever moves.
    sibling-dispose away from C-03, and any consumer wiring a game loop where
    a completion triggers a state change that advances time hits C-01 on day
    one. K0 first regardless -- K1's DONE-WHEN needs the gate.
-2. **K2 today -- the honesty session.** The stale-handle promise is printed in
+2. **K2 -- shipped (1.1.0, 2026-09-05).** The stale-handle promise is printed in
    three documents and false in one probe. Everything the docs say about
    dispose is wrong somewhere.
 3. **K5 is the headline.** It converts the package's marketing sentence into

@@ -8,10 +8,10 @@
 // positionPeek/tPeek/donePeek, and the callback order logs. On divergence the
 // seed and op index print (TORTURE_SEED replays). Stale-handle ABA (C-04) is
 // out of K1 scope, so ops never touch a slot that is dead in either world.
-// Also keeps the C-07 config-fails-open reproduction as a todo (fix in K3).
+// Also gates the C-07 config-law: the three fail-open probe shapes now throw.
 
-import { createClock, LiteClockCapacityError, LiteClockReentrancyError } from "../../Clock.js";
-import { AssertionError, makeRng, SEED, reportTodo } from "./harness.mjs";
+import { createClock, LiteClockReentrancyError } from "../../Clock.js";
+import { AssertionError, makeRng, SEED, assertThrows } from "./harness.mjs";
 
 const OPS = 100000;
 const MAX_LIVE = 48;
@@ -367,32 +367,17 @@ export async function run() {
         console.error = origErr;
     }
 
-    // ---- C-07 (todo, K3): config fails open -------------------------------
-    reportTodo("C-07", function () {
-        const c1 = createClock({ capacty: 4 });
-        const cap = c1.capacity;
-
-        const c2 = createClock();
-        let fired = false;
-        const l = c2.lane({ duration: 10, onComplte: function () { fired = true; } });
-        l.start();
-        c2.advance(20);
-        const laneDone = l.donePeek();
-
-        const c3 = createClock({ growable: 1 });
-        let grewErr = null;
-        try {
-            for (let i = 0; i < 1025; i = (i + 1) | 0) c3.lane({ duration: 1e9 });
-        } catch (e) {
-            grewErr = e;
-        }
-
-        const repro = (cap === 1024 && fired === false && laneDone === true && grewErr instanceof LiteClockCapacityError);
-        return {
-            reproduces: repro,
-            observed: "capacty->cap=" + cap + " onComplte-fired=" + fired + " laneDone=" + laneDone + " growable1-threw=" + (grewErr && grewErr.name)
-        };
-    });
+    // ---- C-07 (GATING, K3): config fails closed ---------------------------
+    // The three fail-before probe shapes (1.1.0 accepted all silently):
+    //   capacty  -> silent capacity 1024;  onComplte -> callback never fired;
+    //   growable:1 -> silently false.  All three now throw with pinned fragments.
+    {
+        const c = createClock();
+        assertThrows(function () { createClock({ capacty: 4 }); }, TypeError, "did you mean 'capacity'?", "t5 C-07 capacty did-you-mean");
+        assertThrows(function () { c.lane({ duration: 10, onComplte: function () {} }); }, TypeError, "did you mean 'onComplete'?", "t5 C-07 onComplte did-you-mean");
+        assertThrows(function () { createClock({ growable: 1 }); }, TypeError, "growable must be a boolean (got number)", "t5 C-07 growable 1");
+    }
+    console.log("t5 fuzz: C-07 config-law gating (3 probe shapes throw with pinned fragments)");
 }
 
 // Uniform engine-world adapter over the real clock.

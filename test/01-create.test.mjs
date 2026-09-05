@@ -55,11 +55,13 @@ test("create: growable opt-in is honored", () => {
     assert.ok(c.capacity > 2);
 });
 
-test("create: non-true growable disables grow", () => {
-    const c = createClock({ capacity: 2, growable: "yes" });
-    c.lane({ duration: 10 });
-    c.lane({ duration: 10 });
-    assert.throws(() => c.lane({ duration: 10 }), LiteClockCapacityError);
+test("create: non-boolean growable is a config error (fail closed)", () => {
+    // Was permissive in 1.1.0 (=== true silently disabled grow). 1.2.0 fails
+    // closed: a present non-boolean growable throws TypeError.
+    assert.throws(
+        () => createClock({ capacity: 2, growable: "yes" }),
+        (e) => e instanceof TypeError && /growable must be a boolean/.test(e.message)
+    );
 });
 
 test("create: public surface is frozen", () => {

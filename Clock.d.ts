@@ -10,10 +10,19 @@ import { Dispose } from "@zakkster/lite-signal";
 // Configuration
 // ---------------------------------------------------------------------------
 
+/**
+ * Configuration for createClock(). Fails closed: an unknown key throws a
+ * TypeError with a did-you-mean hint, never a silent ignore.
+ */
 export interface ClockConfig {
     /** Initial lane pool size. Default: 1024. Max: 65534. */
     capacity?: number;
-    /** When true, pool doubles on exhaustion. Default: false (throws). */
+    /**
+     * When true, the pool doubles on exhaustion up to the 65534 ceiling; the
+     * final growth step clamps, so the ceiling is reachable from any start.
+     * Must be exactly a boolean when present (TypeError otherwise).
+     * Default: false (throws on exhaustion).
+     */
     growable?: boolean;
 }
 
@@ -21,6 +30,10 @@ export interface ClockConfig {
 // Lane handle
 // ---------------------------------------------------------------------------
 
+/**
+ * Options for clock.lane(). Fails closed: an unknown key throws a TypeError
+ * with a did-you-mean hint ("onComplte" -> "did you mean 'onComplete'?").
+ */
 export interface LaneOptions {
     /** Lane duration in sim-time units (typically ms). Must be > 0. */
     duration: number;
@@ -221,7 +234,9 @@ export class LiteClockDisposedError extends Error {
  * object is frozen at the public surface (internal SOA arrays may relocate
  * on growth when `growable: true`).
  *
- * @throws {TypeError}  Wrong-shape config.
+ * @throws {TypeError}  Wrong-shape config, an unknown config key
+ *                      (did-you-mean hint), or a present non-boolean
+ *                      `growable`.
  * @throws {RangeError} Invalid capacity (< 1, non-integer, > 65534).
  */
 export function createClock(config?: ClockConfig): Clock;

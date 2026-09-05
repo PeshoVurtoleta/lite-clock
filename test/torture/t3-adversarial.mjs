@@ -3,11 +3,11 @@
 // re-arm chain (each callback disposes itself and arms a successor) for 10K
 // ticks with the conservation invariant checked every 1K; a no-drop detector
 // after each sequence (every done lane with a registered callback fired exactly
-// once -- tracked in a preallocated Uint32Array side channel). Also keeps the
-// C-05 growth-ceiling reproduction as a todo (fix lands in K3).
+// once -- tracked in a preallocated Uint32Array side channel). Also gates the
+// C-05 growth ceiling: a default-start growable clock reaches exactly 65534.
 
 import { createClock, LiteClockCapacityError } from "../../Clock.js";
-import { assert, assertEq, reportTodo } from "./harness.mjs";
+import { assert, assertEq } from "./harness.mjs";
 
 // ---- preallocated side channels (allocated once, outside every loop) -------
 const N = 10000;
@@ -83,25 +83,80 @@ export async function run() {
         c.dispose();
     }
 
-    // ---- C-05 (todo, K3): the growable ceiling is unreachable --------------
-    // Docs/d.ts/llms.txt say "doubles up to 65534". Growth throws when
-    // oldCap * 2 > 65534, so a default clock stops at 32768.
-    reportTodo("C-05", function () {
+    // ---- C-05 (GATING, K3): the growable ceiling is exactly 65534 ----------
+    // Docs/d.ts/llms.txt say "doubles up to 65534". The final step is a clamp,
+    // not a double: 1024 -> 2048 -> ... -> 32768 -> 65534. The 65535th lane
+    // throws LiteClockCapacityError(65534). Pre-growth lanes survive every
+    // relocation (including the clamped 32768 -> 65534 step) bit-identically.
+    {
         const c = createClock({ growable: true });
-        let n = 0;
+
+        // Pre-growth marker lanes at a spread of ids, started with distinct
+        // positions captured BEFORE any growth. No advance runs during the
+        // allocation loop below, so positionPeek reads stay frozen.
+        const MARKERS = 8;
+        const markers = new Array(MARKERS);
+        const posBefore = new Array(MARKERS);
+        const tBefore = new Array(MARKERS);
+        for (let i = 0; i < MARKERS; i = (i + 1) | 0) {
+            const m = c.lane({ duration: 100 });
+            m.start();
+            markers[i] = m;
+        }
+        c.advance(40);
+        for (let i = 0; i < MARKERS; i = (i + 1) | 0) {
+            posBefore[i] = markers[i].positionPeek();
+            tBefore[i] = markers[i].tPeek();
+            assertEq(posBefore[i], 40, "t3 C-05 marker " + i + " pre-growth position");
+            assertEq(markers[i].donePeek(), false, "t3 C-05 marker " + i + " pre-growth done");
+        }
+        assertEq(c.capacity, 1024, "t3 C-05 default start capacity");
+
+        // Allocate to exhaustion, recording each distinct capacity. capBefore32k
+        // snapshots the markers again right at capacity 32768 so the clamped
+        // 32768 -> 65534 step is proven non-destructive on its own.
+        const trajectory = [c.capacity];
+        let sampledAt32768 = false;
+        let n = MARKERS;
         let err = null;
         try {
-            for (;;) { c.lane({ duration: 1e9 }); n = (n + 1) | 0; }
+            for (;;) {
+                c.lane({ duration: 1e9 });
+                n = (n + 1) | 0;
+                if (c.capacity !== trajectory[trajectory.length - 1]) {
+                    trajectory.push(c.capacity);
+                    if (c.capacity === 32768) {
+                        for (let i = 0; i < MARKERS; i = (i + 1) | 0) {
+                            assertEq(markers[i].positionPeek(), posBefore[i], "t3 C-05 marker " + i + " at 32768");
+                        }
+                        sampledAt32768 = true;
+                    }
+                }
+            }
         } catch (e) {
             err = e;
         }
-        const cap = c.capacity;
-        const repro = (err instanceof LiteClockCapacityError && cap === 32768);
-        return {
-            reproduces: repro,
-            observed: "allocated n=" + n + " capacity=" + cap + " err=" + (err && err.name) + " (docs claim ceiling 65534)"
-        };
-    });
 
-    console.log("t3 adversarial: pass (10k same-tick order + re-arm chain 10k ticks, no drops/doubles)");
+        assert(sampledAt32768, function () { return "t3 C-05: never observed capacity 32768"; });
+        assertEq(trajectory.length, 7, "t3 C-05 trajectory step count");
+        assertEq(trajectory[0], 1024, "t3 C-05 trajectory[0]");
+        assertEq(trajectory[5], 32768, "t3 C-05 trajectory[5]");
+        assertEq(trajectory[6], 65534, "t3 C-05 trajectory[6] (clamp, not double)");
+        assertEq(c.capacity, 65534, "t3 C-05 final capacity exactly 65534");
+        assertEq(n, 65534, "t3 C-05 allocated exactly 65534 lanes");
+        assert(err instanceof LiteClockCapacityError, function () { return "t3 C-05: 65535th lane must throw CapacityError, got " + (err && err.name); });
+        assertEq(err.capacity, 65534, "t3 C-05 CapacityError.capacity");
+        assert(c._invariant() === null, function () { return "t3 C-05 invariant after clamp: " + c._invariant(); });
+
+        // Every pre-growth marker survived the whole growth (incl. the clamp)
+        // bit-identically in position, t, and done.
+        for (let i = 0; i < MARKERS; i = (i + 1) | 0) {
+            assertEq(markers[i].positionPeek(), posBefore[i], "t3 C-05 marker " + i + " position bit-identical post-clamp");
+            assertEq(markers[i].tPeek(), tBefore[i], "t3 C-05 marker " + i + " t bit-identical post-clamp");
+            assertEq(markers[i].donePeek(), false, "t3 C-05 marker " + i + " done bit-identical post-clamp");
+        }
+        c.dispose();
+    }
+
+    console.log("t3 adversarial: pass (10k same-tick order + re-arm chain 10k ticks; C-05 ceiling 65534 bit-exact)");
 }

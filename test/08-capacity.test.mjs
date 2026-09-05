@@ -60,14 +60,17 @@ test("capacity: dispose returns slot so allocate works again under throw", () =>
     assert.ok(fresh);
 });
 
-test("capacity: rejects capacity over MAX_LANES even with growable", () => {
-    // We can construct up to 65534. Growable cannot push beyond that.
-    const c = createClock({ capacity: 0xFFFE - 2, growable: true });
+test("capacity: growth clamps to MAX_LANES, then throws AT the ceiling", () => {
+    // C-05: near-ceiling growth is a clamp, not a double. Start full at 65532,
+    // where 1.1.0 threw because 65532*2 overshoots MAX_LANES. 1.2.0 clamps the
+    // final step to 65534 (the documented ceiling), so growth succeeds here.
+    const c = createClock({ capacity: 0xFFFE - 2, growable: true });   // 65532
+    for (let i = 0; i < (0xFFFE - 2); i++) c.lane({ duration: 10 });   // fill 65532
+    c.lane({ duration: 10 });                                          // grows -> 65534
+    assert.equal(c.capacity, 0xFFFE);
+    // Fill the two clamped slots, then the pool is full AT the ceiling; the next
+    // lane throws because capacity is already MAX_LANES, not because a double
+    // would overshoot.
     c.lane({ duration: 10 });
-    c.lane({ duration: 10 });
-    // Allocations within initial capacity are fine; growth would try to double
-    // beyond MAX_LANES and must throw.
-    for (let i = 0; i < (0xFFFE - 4); i++) c.lane({ duration: 10 });
-    // Now the pool is full at 65534 and growth to 131068 would exceed MAX_LANES.
     assert.throws(() => c.lane({ duration: 10 }), LiteClockCapacityError);
 });

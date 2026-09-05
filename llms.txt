@@ -1,6 +1,6 @@
 # @zakkster/lite-clock
 
-Version: 1.1.0
+Version: 1.2.0
 
 Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray
 lane pool. Deterministic `advance(dt)` -- the only mutation entry point.
@@ -31,10 +31,16 @@ Factory. Returns a frozen `Clock` instance.
 Config (all optional):
 - `capacity: number` -- initial pool size. Default 1024, max 65534. Must be a
   positive integer.
-- `growable: boolean` -- when true, the pool doubles on exhaustion (up to
-  65534). Default false (throws).
+- `growable: boolean` -- when true, the pool doubles on exhaustion up to
+  65534; the final growth step clamps to the ceiling, so 65534 is reachable
+  from any starting capacity. Must be exactly a boolean when present
+  (`TypeError` otherwise -- `growable: 1` is a config error, never `false`).
+  Default false (throws).
 
-Validation throws `TypeError` (shape) / `RangeError` (value) up front.
+Validation is up front and fails closed: an unknown config key throws
+`TypeError` with a did-you-mean hint ("createClock: unknown option 'capacty'
+-- did you mean 'capacity'?"); shape errors throw `TypeError`, value errors
+`RangeError`.
 
 ### `clock.advance(dt: number): void`
 
@@ -72,6 +78,9 @@ Allocate a new lane from the pool.
 Opts:
 - `duration: number` -- > 0, in sim-time units (typically ms)
 - `onComplete?: () => void` -- fires once in the end-of-tick queue
+
+An unknown opts key throws `TypeError` with a did-you-mean hint
+("clock.lane: unknown option 'onComplte' -- did you mean 'onComplete'?").
 
 Throws `LiteClockCapacityError` if the pool is exhausted and `growable: false`.
 
@@ -212,7 +221,10 @@ throws `LiteClockDisposedError`, never `LiteClockReentrancyError`. Reads
   `LiteClockDisposedError`; `simTime`/`ticks` freeze; reads return the frozen
   simTime (never `undefined`). detach()/dispose() stay idempotent no-ops.
 - Reverse only affects reporting. Engine always advances elapsed forward.
-- Pool exhaustion throws by default; `growable: true` doubles up to 65534.
+- Pool exhaustion throws by default; `growable: true` doubles up to 65534
+  (the final growth step clamps to the ceiling -- 65534 is reachable from any
+  start). Config fails closed: unknown option keys on either door and a
+  present non-boolean `growable` throw `TypeError` with a did-you-mean hint.
 - `clock.dispose()` is required for bounded-lifetime clocks (releases the
   frame signal node back to the lite-signal pool).
 

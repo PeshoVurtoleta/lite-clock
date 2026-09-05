@@ -1,4 +1,4 @@
-// @zakkster/lite-clock 1.1.0
+// @zakkster/lite-clock 1.2.0
 // Zero-GC simulation/timeline engine for @zakkster/lite-signal.
 //
 // SOA TypedArray lane pool. Deterministic advance(dt) -- the only mutation
@@ -65,6 +65,80 @@ class LiteClockDisposedError extends Error {
 }
 
 // ---------------------------------------------------------------------------
+// Option-key validation (COLD ZONE -- runs once per createClock()/lane() call,
+// never on advance/read hot paths). Fail closed: an unknown option key is a
+// TypeError with a did-you-mean hint, never a silent ignore.
+// ---------------------------------------------------------------------------
+
+// Data-driven known-key lists so a future option is one array entry, not code.
+const KNOWN_CLOCK_KEYS = ["capacity", "growable"];
+const KNOWN_LANE_KEYS = ["duration", "onComplete"];
+
+// Hand-rolled two-row O(n*m) Levenshtein. Only ever called on the throw path
+// (once per unknown key), so its allocation of two small Int arrays is cold.
+function levenshtein(a, b) {
+    const al = a.length;
+    const bl = b.length;
+    if (al === 0) return bl;
+    if (bl === 0) return al;
+    let prev = new Array(bl + 1);
+    let curr = new Array(bl + 1);
+    for (let j = 0; j <= bl; j = (j + 1) | 0) prev[j] = j;
+    for (let i = 1; i <= al; i = (i + 1) | 0) {
+        curr[0] = i;
+        const ca = a.charCodeAt(i - 1);
+        for (let j = 1; j <= bl; j = (j + 1) | 0) {
+            const cost = (ca === b.charCodeAt(j - 1)) ? 0 : 1;
+            let m = prev[j] + 1;              // deletion
+            const ins = curr[j - 1] + 1;      // insertion
+            if (ins < m) m = ins;
+            const sub = prev[j - 1] + cost;   // substitution
+            if (sub < m) m = sub;
+            curr[j] = m;
+        }
+        const tmp = prev; prev = curr; curr = tmp;
+    }
+    return prev[bl];
+}
+
+// Throw path only: build the did-you-mean TypeError for one unknown key.
+// Kept OUT of validateKeys so the happy-path scan stays small enough to
+// inline into lane() -- lane() is benched (alloc-dispose-churn) and pays for
+// every byte in the scan body. Allocation here is fine: it always throws.
+// Distance cap of 2: past that a "suggestion" is noise, so we list known keys.
+function throwUnknownKey(prefix, k, known) {
+    let best = null;
+    let bestDist = 3;                         // one past the cap; any hit beats it
+    for (let i = 0; i < known.length; i = (i + 1) | 0) {
+        const d = levenshtein(k, known[i]);
+        if (d < bestDist) { bestDist = d; best = known[i]; }
+    }
+    if (best !== null && bestDist <= 2) {
+        throw new TypeError(
+            prefix + ": unknown option '" + k + "' -- did you mean '" + best + "'?"
+        );
+    }
+    throw new TypeError(
+        prefix + ": unknown option '" + k + "' (known keys: " + known.join(", ") + ")"
+    );
+}
+
+// Reject any enumerable string key not in `known` -- own OR inherited
+// (for-in walks the prototype chain; rejecting an inherited junk key is
+// stricter, which is the fail-closed direction). Symbol keys are skipped by
+// for-in and sit outside the option contract: every option read is
+// string-keyed. The happy-path loop is a bare for-in with an indexOf check
+// and NO allocation (the V8 enum-cache bet -- t6's churn window proves
+// createClock/lane stay maxMajor 0). `obj` may be any object; for-in over
+// undefined/null (the degenerate lane() opts already rejected upstream)
+// iterates zero times.
+function validateKeys(obj, known, prefix) {
+    for (const k in obj) {
+        if (known.indexOf(k) === -1) throwUnknownKey(prefix, k, known);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // createClock
 // ---------------------------------------------------------------------------
 
@@ -73,6 +147,7 @@ function createClock(config) {
     if (typeof cfg !== "object") {
         throw new TypeError("createClock: config must be an object");
     }
+    validateKeys(cfg, KNOWN_CLOCK_KEYS, "createClock");
 
     let capacity = cfg.capacity !== undefined ? cfg.capacity : DEFAULT_CAPACITY;
     if (!Number.isInteger(capacity) || capacity <= 0) {
@@ -82,7 +157,19 @@ function createClock(config) {
         throw new RangeError("createClock: capacity exceeds maximum (" + MAX_LANES + ")");
     }
 
-    const growable = cfg.growable === true;
+    // Type-strict: absent (undefined) is false; a present non-boolean is a
+    // config error, never coerced. `null` is not false -- fail closed.
+    let growable;
+    if (cfg.growable === undefined) {
+        growable = false;
+    } else if (typeof cfg.growable !== "boolean") {
+        throw new TypeError(
+            "createClock: growable must be a boolean (got "
+            + (cfg.growable === null ? "null" : typeof cfg.growable) + ")"
+        );
+    } else {
+        growable = cfg.growable;
+    }
 
     // ---- SOA storage (let so growth can rebind) ----------------------------
     let startTimes = new Float64Array(capacity);
@@ -149,9 +236,16 @@ function createClock(config) {
         if (freeTop > 0) return;
         if (!growable) throw new LiteClockCapacityError(capacity);
 
+        // Throw only when ALREADY AT the ceiling with the pool exhausted;
+        // otherwise the final growth is a clamp to MAX_LANES, not a double, so
+        // the documented ceiling of 65534 is reachable (1024 -> ... -> 32768 ->
+        // 65534). The copy/rebind tail below is length-driven and correct for a
+        // non-double step.
+        if (capacity >= MAX_LANES) throw new LiteClockCapacityError(capacity);
+
         const oldCap = capacity;
-        const newCap = oldCap * 2;
-        if (newCap > MAX_LANES) throw new LiteClockCapacityError(oldCap);
+        let newCap = oldCap * 2;
+        if (newCap > MAX_LANES) newCap = MAX_LANES;
 
         const ns = new Float64Array(newCap);
         ns.set(startTimes);
@@ -546,6 +640,7 @@ function createClock(config) {
         if (opts === null || typeof opts !== "object") {
             throw new TypeError("clock.lane: opts must be an object");
         }
+        validateKeys(opts, KNOWN_LANE_KEYS, "clock.lane");
         const dur = opts.duration;
         if (!Number.isFinite(dur) || dur <= 0) {
             throw new RangeError("clock.lane: opts.duration must be a finite positive number");
@@ -653,6 +748,6 @@ function createClock(config) {
 // Exports
 // ---------------------------------------------------------------------------
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 export {createClock, LiteClockCapacityError, LiteClockReentrancyError, LiteClockDisposedError, VERSION};

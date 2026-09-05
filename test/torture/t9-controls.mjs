@@ -34,6 +34,14 @@ export async function run() {
             + "  stderr: " + tail(stale.stderr, 400);
     });
 
+    const config = spawnControl("config");
+    assert(config.status !== 0, function () {
+        return "t9 control 'config' exited 0 (gate is decorative)\n"
+            + "  stdout: " + tail(config.stdout, 400) + "\n"
+            + "  stderr: " + tail(config.stderr, 400);
+    });
+
     console.log("t9 controls: pass (alloc exit=" + alloc.status
-        + " leak exit=" + leak.status + " stale exit=" + stale.status + ")");
+        + " leak exit=" + leak.status + " stale exit=" + stale.status
+        + " config exit=" + config.status + ")");
 }

@@ -158,8 +158,9 @@ high-scale reactive systems.
 `createClock(config)` performs all setup up front and returns a frozen handle:
 
 ```
-config validation         capacity is positive int, <= 65534
-                          growable is boolean
+config validation         unknown keys throw (did-you-mean hint)
+                          capacity is positive int, <= 65534
+                          growable is strictly boolean
                           --------------------------------------
 SOA allocation             Float64Array startTimes
                            Float64Array durations
@@ -281,9 +282,13 @@ const clock = createClock({
 });
 ```
 
-Validation:
+Validation (fails closed):
+- an unknown config key throws `TypeError` with a did-you-mean hint --
+  `createClock({capacty: 4})` throws
+  `"createClock: unknown option 'capacty' -- did you mean 'capacity'?"`
 - `capacity` must be a positive integer <= 65534 (else `RangeError`)
-- `growable` is interpreted strictly: only `=== true` enables growth
+- `growable` must be exactly a boolean when present (else `TypeError`);
+  absent means `false`
 
 ### clock.advance
 
@@ -312,8 +317,11 @@ const lane = clock.lane({
 });
 ```
 
-Allocates from the pool. Throws `LiteClockCapacityError` when the pool is
-exhausted and `growable: false`. With `growable: true`, doubles up to 65534.
+Allocates from the pool. An unknown opts key throws `TypeError` with a
+did-you-mean hint (`onComplte` -> `"did you mean 'onComplete'?"`). Throws
+`LiteClockCapacityError` when the pool is exhausted and `growable: false`.
+With `growable: true`, doubles up to 65534 -- the final growth step clamps to
+the ceiling, so 65534 is reachable from any starting capacity.
 
 ### lane.start / pause / reverse / dispose
 

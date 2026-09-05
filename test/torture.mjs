@@ -1,9 +1,9 @@
 // test/torture.mjs -- node --expose-gc test/torture.mjs
 // The authoritative memory + determinism gate for @zakkster/lite-clock.
-// Tiers t0/t1/t6/t7/t8/t9 gate; t2-t5 replay findings C-01..C-08 as todo
-// reproductions (visible, replayable, never affecting the exit code).
-// Prints exactly "ok" on success and exits 0; on any gating failure prints the
-// details and exits 1. Seeded xorshift32 PRNG; TORTURE_SEED replays a run.
+// All ten tiers (t0-t9) gate: every finding C-01..C-08 plus C-05/C-07 is now a
+// hard assertion, no todo reproductions remain. Prints exactly "ok" on success
+// and exits 0; on any gating failure prints the details and exits 1. Seeded
+// xorshift32 PRNG; TORTURE_SEED replays a run.
 
 import { SEED } from "./torture/harness.mjs";
 
@@ -26,6 +26,9 @@ if (control !== undefined && control !== "") {
     } else if (control === "stale") {
         const m = await import("./torture/t4-handles.mjs");
         await m.runControlStale();
+    } else if (control === "config") {
+        const m = await import("./torture/t1-degenerate.mjs");
+        await m.runControlConfig();
     } else {
         console.error("torture: unknown TORTURE_CONTROL '" + control + "'");
         process.exit(1);
@@ -41,9 +44,9 @@ const TIERS = [
     { name: "t0", file: "./torture/t0-laws.mjs", gating: true },
     { name: "t1", file: "./torture/t1-degenerate.mjs", gating: true },
     { name: "t2", file: "./torture/t2-reentrancy.mjs", gating: true },
-    { name: "t3", file: "./torture/t3-adversarial.mjs", gating: false },
+    { name: "t3", file: "./torture/t3-adversarial.mjs", gating: true },
     { name: "t4", file: "./torture/t4-handles.mjs", gating: true },
-    { name: "t5", file: "./torture/t5-fuzz.mjs", gating: false },
+    { name: "t5", file: "./torture/t5-fuzz.mjs", gating: true },
     { name: "t8", file: "./torture/t8-cross.mjs", gating: true },
     { name: "t6", file: "./torture/t6-alloc.mjs", gating: true },
     { name: "t7", file: "./torture/t7-soak.mjs", gating: true },

@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 1.2.0 -- 2026-09-05
+
+Config-law release. Every documented option is now validated closed, and the
+documented growth ceiling is actually reachable. Valid configs behave
+byte-identically to 1.1.0: `advance()`, the callback drain, and every read
+path are diff-identical -- the whole diff sits in the cold validation zone
+plus `ensureCapacity`'s new-capacity computation.
+
+### Fixed
+
+- **C-05 -- the growable ceiling was unreachable.** Growth doubled and threw
+  when the double exceeded 65534, so a default-capacity clock stopped at
+  32768 (fail-before: `createClock({growable: true})` + alloc until throw ->
+  `LiteClockCapacityError` at `capacity === 32768`). The final growth step
+  now clamps to the ceiling: 1024 -> 2048 -> ... -> 32768 -> 65534. Growth
+  throws only when the pool is exhausted while already AT 65534, and the
+  error's `.capacity` reads 65534. The docs sentence "doubles up to 65534"
+  is now literally true. The clamped (non-double) step preserves every
+  existing lane's position/t/done bit-for-bit (gated in torture t3).
+
+### Changed
+
+- **Unknown option keys now throw (C-07).** `createClock({capacty: 4})`
+  silently returned a 1024-capacity clock; `lane({duration, onComplte: fn})`
+  silently never fired the callback -- the animation ran, the chain broke,
+  nothing said why. Both doors now throw `TypeError` with a did-you-mean
+  hint ("createClock: unknown option 'capacty' -- did you mean 'capacity'?");
+  a key with no near match (Levenshtein distance > 2) lists the known keys
+  instead. Code that passed junk keys was already broken silently; now it is
+  broken loudly, which is the upgrade.
+- **`growable` must be exactly a boolean when present (C-07).**
+  `growable: 1` was silently treated as `false` (only `=== true` enabled
+  growth); any present non-boolean now throws `TypeError` naming the
+  received type. Absent still means `false`.
+- Validation order at both doors: shape check, then the unknown-key scan,
+  then the per-key value checks. Value validation is byte-identical to
+  1.1.0 (same classes, same messages).
+
+### Testing
+
+- Torture tiers t3 and t5 flip from todo to gating -- the C-05 and C-07
+  reproductions registered in K0 are now fail-closed assertions, and all
+  ten tiers gate. t9 gains a fourth control (`config`): the unknown-key
+  detector run against a deliberately fail-open shim must exit non-zero,
+  proving the new gate can fail. New unit suite `13-config-law.test.mjs`
+  pins both findings fail-before/pass-after.
+
+### Performance
+
+Provenance: node v26.3.1, darwin arm64, `npm run bench` x3 BEFORE (1.1.0)
+and x3 AFTER (1.2.0). Within-noise law: overlapping min/max or mean delta
+under 10%.
+
+BEFORE (1.1.0), ops/s:
+
+- idle-advance:          64.74M / 65.18M / 65.01M
+- active-lanes-1k:      358.31M / 352.56M / 351.22M
+- lane-reads-tracked:    14.87M / 12.28M / 13.61M
+- alloc-dispose-churn:   22.19M / 21.75M / 21.93M
+- completion-fanout-100:  8.60M /  8.46M /  8.67M
+- attach-interval-once: 110.38K / 118.75K / 110.35K
+
+AFTER (1.2.0), ops/s:
+
+- idle-advance:          68.84M / 69.07M / 67.01M
+- active-lanes-1k:      372.85M / 357.74M / 365.96M
+- lane-reads-tracked:    14.71M / 13.04M / 14.06M
+- alloc-dispose-churn:   20.63M / 20.70M / 18.78M
+- completion-fanout-100:  8.49M /  8.59M /  8.50M
+- attach-interval-once: 133.94K / 132.82K / 136.22K
+
+- alloc-dispose-churn: mean 20.04M vs 21.96M, about -9% -- the cost of the
+  unknown-key scan in `lane()` (a bare for-in over the opts object; zero
+  allocation on the happy path, proven by t6's churn window at maxMajor 0).
+  A first-cut validator measured -13%; splitting the throw path out of the
+  scan so the happy-path loop inlines into `lane()` recovered about half.
+  Within the noise law, and ~20M full alloc/start/dispose cycles per second
+  remains orders of magnitude from any real workload. Recorded per the
+  "either way" law.
+- Every other scenario: overlapping ranges or faster. `advance()` and the
+  read paths took zero new instructions -- proven by diff, not measurement.
+
 ## 1.1.0 -- 2026-09-05
 
 Lifecycle-honesty release. A stale handle can no longer touch its slot's next

@@ -1,7 +1,7 @@
 // test/torture/t1-degenerate.mjs -- degenerate scalar inputs (GATING).
-// Pins ONLY behavior that is correct today. Throws pinned by error class AND
-// message fragment (the message names the contract). Does NOT pin the
-// unknown-key silent-accept (C-07) or the 32768 growth ceiling (C-05).
+// Pins behavior pinned by error class AND message fragment (the message names
+// the contract). Includes the C-07 config-law cells: unknown option keys on
+// both doors throw with a did-you-mean hint, and a non-boolean growable throws.
 
 import { createClock, LiteClockCapacityError } from "../../Clock.js";
 import { assert, assertEq, assertThrows, assertNoThrow } from "./harness.mjs";
@@ -73,6 +73,32 @@ export async function run() {
         assertNoThrow(function () { createClock({ capacity: 65534 }); }, "capacity 65534");
     }
 
+    // ---- C-07: config-law -- unknown keys on both doors, non-boolean growable
+    {
+        // createClock door: near-miss typo -> did-you-mean; junk -> known-keys.
+        assertThrows(function () { createClock({ capacty: 4 }); }, TypeError, "did you mean 'capacity'?", "createClock typo capacty");
+        assertThrows(function () { createClock({ growble: true }); }, TypeError, "did you mean 'growable'?", "createClock typo growble");
+        assertThrows(function () { createClock({ frobnicate: 1 }); }, TypeError, "known keys: capacity, growable", "createClock junk key");
+
+        // lane door: near-miss typo -> did-you-mean; junk -> known-keys.
+        const c = createClock();
+        assertThrows(function () { c.lane({ duration: 10, onComplte: function () {} }); }, TypeError, "did you mean 'onComplete'?", "lane typo onComplte");
+        assertThrows(function () { c.lane({ duratoin: 10 }); }, TypeError, "did you mean 'duration'?", "lane typo duratoin");
+        assertThrows(function () { c.lane({ duration: 10, frobnicate: 1 }); }, TypeError, "known keys: duration, onComplete", "lane junk key");
+
+        // growable non-boolean cross -- each throws naming the received type.
+        assertThrows(function () { createClock({ growable: 1 }); }, TypeError, "growable must be a boolean (got number)", "growable 1");
+        assertThrows(function () { createClock({ growable: 0 }); }, TypeError, "growable must be a boolean (got number)", "growable 0");
+        assertThrows(function () { createClock({ growable: "true" }); }, TypeError, "growable must be a boolean (got string)", "growable string");
+        assertThrows(function () { createClock({ growable: null }); }, TypeError, "growable must be a boolean (got null)", "growable null");
+        assertThrows(function () { createClock({ growable: {} }); }, TypeError, "growable must be a boolean (got object)", "growable object");
+
+        // Legal shapes stay legal: undefined keys are absent, booleans pass.
+        assertNoThrow(function () { createClock({ growable: undefined }); }, "growable undefined");
+        assertNoThrow(function () { createClock({ capacity: undefined }); }, "capacity undefined");
+        assertNoThrow(function () { createClock({ capacity: 2, growable: true }); }, "growable true");
+    }
+
     // ---- C-12: dur <= 0 is unreachable for any readable handle ------------
     // lane() rejects duration <= 0 and non-finite / non-number up front, so
     // durations[id] is always > 0 for an allocated slot. The deleted `dur <= 0`
@@ -110,4 +136,32 @@ export async function run() {
         }
         assertThrows(function () { c.lane({ duration: 1e9 }); }, LiteClockCapacityError, "capacity", "full-pool exhaustion");
     }
+}
+
+// ---- control: the t1 config-law gate must be able to FAIL -------------------
+// Drive the C-07 unknown-key detector against a deliberately fail-open shim that
+// strips unknown keys and coerces growable with `=== true` (mimicking 1.1.0's
+// silent ignore). The detector demands a typo'd key throw; the shim swallows it,
+// so the detector must trip -> non-zero exit. This proves the t1 config cells
+// are load-bearing, not decorative. A shim that somehow passes reaches exit 0
+// so t9 catches a decorative gate.
+export async function runControlConfig() {
+    // Fail-open shim: silently drop any key not in the known list; growable via
+    // `=== true` (the exact 1.1.0 behavior C-07 fixed).
+    function shimClock(cfg) {
+        const clean = {};
+        if (cfg && cfg.capacity !== undefined) clean.capacity = cfg.capacity;
+        clean.growable = (cfg && cfg.growable) === true;
+        return createClock(clean);
+    }
+    try {
+        // Detector: a typo'd config key MUST throw did-you-mean. The shim strips
+        // it and returns a clock, so this assertThrows finds no throw and raises.
+        assertThrows(function () { shimClock({ capacty: 4 }); }, TypeError, "did you mean", "control-config detector: typo must throw");
+    } catch (e) {
+        console.error("[control config] detector tripped as expected: " + (e && e.message));
+        process.exit(1);
+    }
+    console.error("[control config] detector did NOT trip -- gate decorative");
+    process.exit(0);
 }

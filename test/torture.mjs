@@ -29,6 +29,9 @@ if (control !== undefined && control !== "") {
     } else if (control === "config") {
         const m = await import("./torture/t1-degenerate.mjs");
         await m.runControlConfig();
+    } else if (control === "naive-carry") {
+        const m = await import("./torture/t1-degenerate.mjs");
+        await m.runControlNaiveCarry();
     } else {
         console.error("torture: unknown TORTURE_CONTROL '" + control + "'");
         process.exit(1);

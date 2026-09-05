@@ -7,6 +7,143 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 1.3.0 -- 2026-09-05
+
+The earned-surface release: clock-wide `timeScale`, `lane.seek()`/`restart()`,
+`loop`/`pingPong` lanes with a bit-exact overshoot carry, and `clock.stats()`.
+Additive only -- every t0 determinism law holds bit-for-bit, the survivor arm
+of `advance()` is diff-identical to 1.2.0, and valid 1.2.0 programs behave
+identically (new throws exist only for inputs 1.2.0 already rejected as
+unknown keys).
+
+### Added
+
+- **`clock.timeScale`** (get/set): finite `>= 0`, applied to `advance(dt)`
+  once at entry (`dt * timeScale`); a product that overflows to non-finite
+  throws `RangeError` naming both inputs. `0` is a legal freeze: `advance()`
+  still ticks and propagates the frame signal but completes nothing.
+  `advanceTo(t)` is absolute and UNSCALED -- it reaches `t` exactly at any
+  timeScale (0 included); the identity `advanceTo(t) == advance(t - simTime)`
+  now holds only at `timeScale === 1`. `attachRAF`/`attachInterval` feed
+  wall-clock dts through `advance()`, so they scale -- that is the
+  slow-motion semantic. timeScale is replay state and will ride in K5's
+  snapshot format.
+- **`lane.seek(position)` / `lane.restart()`** -- seek is an authored EDIT,
+  not time (decisions/0003-seek.md): clamps a finite position to
+  `[0, duration]`, re-bases the cycle carry, clears DONE iff the new position
+  is below duration, and NEVER starts, completes, fires, or ticks the frame
+  signal (peeks see it immediately; tracked reads on the next tick).
+  Non-finite positions throw `RangeError` on a live handle; stale handles
+  stay true silent no-ops even for garbage input. `seek(duration)` does not
+  complete the lane: completion stays advance-exclusive and needs a
+  compaction pass, so a following `advance(0)` completes nothing while any
+  `advance(dt > 0)` completes it. `restart()` = `seek(0)` + `start()` and
+  replaces the dispose/realloc replay pattern the docs used to recommend.
+- **`lane({loop: true})` / `lane({pingPong: true})`** (mutually exclusive;
+  both true throws `TypeError`): on completion the lane carries the overshoot
+  and stays active instead of going DONE -- `done()` reports false for its
+  whole life, `onComplete` fires once per completed cycle (a single advance
+  spanning N cycles fires N times), and pingPong flips the same REVERSE flag
+  `reverse()` toggles, so the two compose. The carry is recomputed from a
+  stored base and an integer cycle count (`base + k*duration`, one rounding),
+  never float-accumulated -- that is what keeps dt-split invariance BIT-EXACT
+  across cycle boundaries (gated in t0; a naive accumulating carry is torture
+  control #5 and demonstrably diverges).
+- **`clock.stats(out?)`**: `poolUsed`, `poolFree`, `peakActive`,
+  `totalTicks`, `totalCompletions`, `capacity`, `timeScale`. With `out` it
+  fills the sink in place and returns it -- zero allocation, gated in t6's
+  churn window. Without `out` it allocates a fresh object (the documented
+  convenience form). Read surface: callable after dispose with frozen
+  counters. `totalCompletions` counts cycles, including callback-less lanes.
+- Bench gains a seventh cell, `loop-cycle-100`, isolating the completion-arm
+  carry branch (the existing fanout cell is createClock-dominated and
+  active-lanes-1k never completes a lane).
+
+### Changed
+
+- **The completion drain guard is generation-based.** The 1.2.0 drain
+  re-checked FLAG_DONE before firing; loop lanes are never DONE, so the
+  guard now compares the lane's generation captured at queue time (and
+  re-checks before EVERY per-cycle fire -- a callback disposing its own lane
+  stops the remaining fires). Any disposal bumps the generation and a
+  reallocated tenant keeps the bump, so every C-03 case remains caught; the
+  C-01/C-02/C-03 pins pass unmodified as proof.
+- `KNOWN_LANE_KEYS` grew to `duration, onComplete, loop, pingPong`; the two
+  literal known-keys message pins updated with it
+  (`test/13-config-law.test.mjs`, `test/torture/t1-degenerate.mjs`) -- the
+  only 1.2.0 test edits in the release.
+
+### Testing
+
+- t0 extends to cycling lanes: dt-split invariance for loop and pingPong
+  (state AND per-lane fire counts, strictly equal, including a
+  three-cycles-in-one-call partition) plus a pingPong triangle-wave check
+  against an integer-k oracle. t3 gains adversarial cells: 10,000 cycles in
+  one tick (exactly 10,000 fires, exact final position), the 2^30 k-fold
+  boundary, seek/timeScale validation, and a 1000-dt timeScale=0 freeze. t5's
+  fuzz oracle models base/k/loop/pingPong/reverse and timeScale with the same
+  arithmetic as the engine; the op mix gains SEEK/RESTART/SET_TIMESCALE
+  (100K ops, zero divergence). t6's churn window now also runs `seek`,
+  `restart`, and `stats(out)` under the same maxMajor 0 budget. t9 gains a
+  fifth control (`naive-carry`): the float-accumulating carry driven through
+  the real t0 dt-split comparison must exit non-zero. New unit suites
+  14-timescale, 15-seek-restart, 16-loop-pingpong, 17-stats.
+
+### Performance
+
+Provenance: node v26.3.1, darwin arm64, `npm run bench` x3 BEFORE (1.2.0
+bytes, same session and machine; re-verified contemporaneously mid-session)
+and x3 AFTER (1.3.0 final bytes). Within-noise law: overlapping min/max or
+mean delta < 10%.
+
+| scenario | 1.2.0 (x3) | 1.3.0 (x3) | mean delta |
+| --- | --- | --- | --- |
+| idle-advance | 67.49 / 67.43 / 66.88M | 56.43 / 61.97 / 62.41M | -10.4% |
+| active-lanes-1k | 347.80 / 360.55 / 363.95M | 366.32 / 360.36 / 349.31M | +0.3% |
+| lane-reads-tracked | 15.03 / 14.50 / 13.52M | 13.79 / 13.81 / 13.02M | -5.6% |
+| alloc-dispose-churn | 20.25 / 19.21 / 19.62M | 17.04 / 17.21 / 16.39M | -14.3% |
+| completion-fanout-100 | 8.71 / 8.66 / 8.53M | 7.61 / 7.60 / 7.46M | -12.4% |
+| attach-interval-once | 140.76 / 139.40 / 135.71K | 111.75 / 126.65 / 117.82K | -14.3% |
+| loop-cycle-100 | n/a (feature does not exist) | 119.83 / 121.25 / 116.57M | AFTER-only |
+
+The two claims that matter, measured true:
+
+- **The survivor path is free.** active-lanes-1k (1000 active lanes that
+  never complete -- the pure survivor arm) is +0.3% with overlapping ranges,
+  matching the byte-identical diff proof. The spec's revert clause was tied
+  to this cell; it does not fire.
+- **The carry branch costs what it looks like.** loop-cycle-100 (100 loop
+  lanes completing one cycle per advance, ten with callbacks) sustains
+  ~119M lane-cycles/s -- the carry recompute plus queue/drain runs at about
+  3x the per-lane cost of the survivor arm.
+
+Recorded regressions, outside the noise law, with mechanisms:
+
+- **idle-advance -10.4%**: `advance()` is now a validate-and-scale wrapper
+  around the internal `advanceBy()` (the timeScale entry law); V8 does not
+  inline the large tick body, so a bare tick pays one extra call. Duplicating
+  the 90-line tick body into both entry points would remove it and was
+  rejected -- two copies of the core invariant body is the wrong trade.
+- **alloc-dispose-churn -14.3%**: `lane()` reads the two new option keys and
+  computes the mode; alloc/start/dispose each gained one register-level
+  mode-bit test, and start maintains `peakActive`.
+- **attach-interval-once -14.3% / completion-fanout-100 -12.4%**: both cells
+  are createClock-lifecycle-dominated, and `createClock` now builds five more
+  closures plus the `timeScale` accessor pair on the frozen instance
+  (isolated probe: bare createClock+dispose 8.47 -> 9.23 microseconds,
+  +8.9%). The fanout completion arm additionally writes cycles + generation
+  per queue entry and the drain re-checks the generation per fire.
+- One authorized tune, applied and kept: the carry arrays
+  (`baseStartTimes`/`cycleCounts`) and per-tick queue scratch
+  (`completedCycles`/`completedGens`) are materialized lazily by the first
+  `lane()` call (first cycling lane for the carry pair), with mode-bit
+  guards at the cold write-sites, so a bare `createClock()`/`dispose()`
+  cycle allocates nothing beyond 1.2.0. Before the tune, first-cut K4 bytes
+  measured attach-interval-once at -42% mean; the tune recovered it to
+  -14.3%. The residue is the API surface itself, not the arrays.
+
+---
+
 ## 1.2.0 -- 2026-09-05
 
 Config-law release. Every documented option is now validated closed, and the

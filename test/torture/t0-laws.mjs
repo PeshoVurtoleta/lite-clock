@@ -37,6 +37,46 @@ function compareFireCounts(fa, fb, label) {
     }
 }
 
+// ---- loop/pingPong arm helpers (dt-split invariance for cycling lanes) ------
+// Mixed loop and pingPong lanes. Lane 2's duration is deliberately NON-DYADIC
+// (0.3): k*dur then rounds differently per carry event, so the split-equality
+// assertions are ulp-sensitive and FAIL if the engine regresses to a float-
+// accumulating carry (reviewer blocker; see scratch failbefore-k4 evidence --
+// the naive carry diverges at dur=0.3 while the recompute stays bit-equal).
+// Integer dts keep simTime itself bit-identical across the splits.
+const M = 4;
+const LOOP_DURS = [10, 8, 0.3, 4];
+const LOOP_MODES = ["loop", "pingPong", "loop", "pingPong"];
+const lfcA = new Int32Array(M);
+const lfcB = new Int32Array(M);
+
+function armLoopLanes(c, fireCounts) {
+    const lanes = new Array(M);
+    for (let i = 0; i < M; i = (i + 1) | 0) {
+        const idx = i;
+        const opts = { duration: LOOP_DURS[idx], onComplete: function () { fireCounts[idx] = (fireCounts[idx] + 1) | 0; } };
+        if (LOOP_MODES[idx] === "loop") opts.loop = true; else opts.pingPong = true;
+        const l = c.lane(opts);
+        l.start();
+        lanes[i] = l;
+    }
+    return lanes;
+}
+
+function compareLoopLanes(la, lb, label) {
+    for (let i = 0; i < M; i = (i + 1) | 0) {
+        assertEq(la[i].positionPeek(), lb[i].positionPeek(), function () { return label + " position loop-lane " + i; });
+        assertEq(la[i].tPeek(), lb[i].tPeek(), function () { return label + " t loop-lane " + i; });
+        assertEq(la[i].donePeek(), lb[i].donePeek(), function () { return label + " done loop-lane " + i; });
+    }
+}
+
+function compareLoopFireCounts(fa, fb, label) {
+    for (let i = 0; i < M; i = (i + 1) | 0) {
+        assertEq(fa[i], fb[i], function () { return label + " fireCount loop-lane " + i; });
+    }
+}
+
 export async function run() {
     // ---- dt-split invariance: advance(a);advance(b) == advance(a+b) --------
     {
@@ -76,6 +116,95 @@ export async function run() {
         assertEq(c1.simTime, c2.simTime, "advanceTo simTime");
         compareLanes(l1, l2, "advanceTo");
         compareFireCounts(fcA, fcB, "advanceTo");
+    }
+
+    // ---- loop/pingPong dt-split invariance (2-way) ------------------------
+    // Same total reached two ways yields bit-identical positions/t/done AND
+    // identical per-lane onComplete fire counts for cycling lanes.
+    {
+        const a = 17, b = 13;                  // total 30 (exact; no float error)
+        lfcA.fill(0); lfcB.fill(0);
+        const c1 = createClock(); const l1 = armLoopLanes(c1, lfcA);
+        c1.advance(a); c1.advance(b);
+        const c2 = createClock(); const l2 = armLoopLanes(c2, lfcB);
+        c2.advance(a + b);
+        assertEq(c1.simTime, c2.simTime, "loop dt-split 2way simTime");
+        compareLoopLanes(l1, l2, "loop dt-split 2way");
+        compareLoopFireCounts(lfcA, lfcB, "loop dt-split 2way");
+    }
+
+    // ---- loop/pingPong dt-split invariance (3-way) ------------------------
+    {
+        const a = 12, b = 7, c = 11;           // total 30
+        lfcA.fill(0); lfcB.fill(0);
+        const cx = createClock(); const lx = armLoopLanes(cx, lfcA);
+        cx.advance(a); cx.advance(b); cx.advance(c);
+        const cy = createClock(); const ly = armLoopLanes(cy, lfcB);
+        cy.advance((a + b) + c);
+        assertEq(cx.simTime, cy.simTime, "loop dt-split 3way simTime");
+        compareLoopLanes(lx, ly, "loop dt-split 3way");
+        compareLoopFireCounts(lfcA, lfcB, "loop dt-split 3way");
+    }
+
+    // ---- loop/pingPong: one call spans >=3 cycles vs one-per-call crossing --
+    // Left side is a single advance(30) (the dur-10 and dur-4 lanes each span
+    // >=3 cycles in one call); right side crosses one cycle per call for the
+    // dur-10 lane (advance(10) x3). State + fire counts must match bit-for-bit.
+    {
+        lfcA.fill(0); lfcB.fill(0);
+        const cs = createClock(); const ls = armLoopLanes(cs, lfcA);
+        cs.advance(30);
+        const cm = createClock(); const lm = armLoopLanes(cm, lfcB);
+        cm.advance(10); cm.advance(10); cm.advance(10);
+        assertEq(cs.simTime, cm.simTime, "loop span-vs-step simTime");
+        compareLoopLanes(ls, lm, "loop span-vs-step");
+        compareLoopFireCounts(lfcA, lfcB, "loop span-vs-step");
+    }
+
+    // ---- loop carry ulp-sensitivity at scale (probe-pinned recipe) --------
+    // dur=0.3, total 3000 (10000 cycles): the fail-before probe shows a
+    // float-accumulating carry ends ~0.3 OFF between these two splits while
+    // the recompute carry is bit-equal (scratch failbefore-k4: hex-divergent
+    // at exactly this recipe). Span (one advance) vs unit steps (x3000).
+    {
+        let fa = 0, fb = 0;
+        const ca = createClock();
+        const la = ca.lane({ duration: 0.3, loop: true, onComplete: function () { fa = (fa + 1) | 0; } });
+        la.start();
+        ca.advance(3000);
+        const cb = createClock();
+        const lb = cb.lane({ duration: 0.3, loop: true, onComplete: function () { fb = (fb + 1) | 0; } });
+        lb.start();
+        for (let s = 0; s < 3000; s = (s + 1) | 0) cb.advance(1);
+        assertEq(ca.simTime, cb.simTime, "loop ulp-recipe simTime");
+        assertEq(la.positionPeek(), lb.positionPeek(), "loop ulp-recipe position");
+        assertEq(la.tPeek(), lb.tPeek(), "loop ulp-recipe t");
+        assertEq(fa, fb, "loop ulp-recipe fire count");
+    }
+
+    // ---- pingPong triangle closed form vs an integer-k oracle -------------
+    // dur 8, 41 steps of 1.7. After each step compare tPeek against an
+    // independently tracked oracle computing base + k*dur with the SAME
+    // expression (never %), reflecting on odd k. simTime is accumulated by the
+    // same left-to-right addition the engine uses, so the compare is exact.
+    {
+        const dur = 8, step = 1.7, base = 0;
+        const c = createClock();
+        const l = c.lane({ duration: dur, pingPong: true });
+        l.start();
+        let simTime = 0;
+        for (let s = 0; s < 41; s = (s + 1) | 0) {
+            c.advance(step);
+            simTime = simTime + step;
+            const k = Math.floor((simTime - base) / dur);
+            const startT = base + k * dur;
+            const pos = simTime - startT;
+            const ratio = pos / dur;
+            const expected = ((k & 1) === 1) ? (1 - ratio) : ratio;
+            const si = s;
+            assertEq(l.tPeek(), expected, function () { return "pingPong triangle step " + si + " (k=" + k + ")"; });
+            assertEq(l.donePeek(), false, function () { return "pingPong triangle never done step " + si; });
+        }
     }
 
     // ---- replay determinism: same op script -> identical logs -------------

@@ -84,7 +84,7 @@ export async function run() {
         const c = createClock();
         assertThrows(function () { c.lane({ duration: 10, onComplte: function () {} }); }, TypeError, "did you mean 'onComplete'?", "lane typo onComplte");
         assertThrows(function () { c.lane({ duratoin: 10 }); }, TypeError, "did you mean 'duration'?", "lane typo duratoin");
-        assertThrows(function () { c.lane({ duration: 10, frobnicate: 1 }); }, TypeError, "known keys: duration, onComplete", "lane junk key");
+        assertThrows(function () { c.lane({ duration: 10, frobnicate: 1 }); }, TypeError, "known keys: duration, onComplete, loop, pingPong", "lane junk key");
 
         // growable non-boolean cross -- each throws naming the received type.
         assertThrows(function () { createClock({ growable: 1 }); }, TypeError, "growable must be a boolean (got number)", "growable 1");
@@ -163,5 +163,45 @@ export async function runControlConfig() {
         process.exit(1);
     }
     console.error("[control config] detector did NOT trip -- gate decorative");
+    process.exit(0);
+}
+
+// ---- control: the t0 loop dt-split law must be able to FAIL ------------------
+// A carry that float-ACCUMULATES the lane start (start += cycles*dur per
+// completion batch) instead of RECOMPUTING it (start = base + k*dur, one
+// rounding) drifts under a dt-split. Drive the naive carry through the t0
+// dt-split comparison: two splits of the SAME integer total reach a bit-
+// identical simTime, so the recompute carry the engine ships gives identical
+// positions -- the naive carry drifts and trips the equality assertion, forcing
+// a non-zero exit. Fail-before evidence: scratchpad/failbefore-k4.txt
+// (dur 0.3, total 3000, ~10000 cycles: naive posA=0 vs posB=0.2999999999269676;
+// recompute posA===posB===0).
+export async function runControlNaiveCarry() {
+    function naiveLane(dur) { return { start: 0, pos: 0, dur: dur }; }
+    function naiveStep(L, simTime) {
+        const elapsed = simTime - L.start;
+        if (elapsed >= L.dur) {
+            const cycles = Math.floor(elapsed / L.dur);
+            L.start = L.start + cycles * L.dur;      // NAIVE accumulation (drift)
+            L.pos = simTime - L.start;
+        } else {
+            L.pos = elapsed;
+        }
+    }
+    const dur = 0.3;
+    const total = 3000;                              // ~10000 cycles
+    const A = naiveLane(dur);
+    naiveStep(A, total);                             // side A: one big advance
+    const B = naiveLane(dur);
+    for (let s = 1; s <= total; s = (s + 1) | 0) naiveStep(B, s);   // side B: unit advances
+    try {
+        // The t0 law: any dt partition of the same total yields bit-identical
+        // positions. Naive carry violates it.
+        assertEq(A.pos, B.pos, "naive-carry dt-split must be bit-exact (t0 law)");
+    } catch (e) {
+        console.error("[control naive-carry] gate tripped as expected: " + (e && e.message));
+        process.exit(1);
+    }
+    console.error("[control naive-carry] gate did NOT trip -- naive carry bit-exact (impossible)");
     process.exit(0);
 }

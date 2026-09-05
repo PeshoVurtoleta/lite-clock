@@ -33,9 +33,18 @@ function makeOracle() {
     const activeList = [];
     let simTime = 0;
     let advancing = false;
+    let timeScale = 1;
 
-    function createLane(dur, cb) {
-        return { alloc: true, active: false, done: false, reversed: false, start: 0, dur: dur, pos: 0, cb: cb, aidx: -1 };
+    // mode: 0 (one-shot), "loop", or "pingPong". base/k mirror baseStartTimes/
+    // cycleCounts; ONE reversed boolean carries both user reverse() and the
+    // pingPong per-cycle flip (they XOR the same flag). gen mirrors the slot
+    // generation for the drain re-check.
+    function createLane(dur, cb, mode) {
+        return {
+            alloc: true, active: false, done: false, reversed: false,
+            start: 0, base: 0, k: 0, dur: dur, pos: 0, cb: cb, aidx: -1, gen: 0,
+            loop: mode === "loop", pingPong: mode === "pingPong"
+        };
     }
     function start(L) {
         if (!L.alloc) return;
@@ -43,6 +52,8 @@ function makeOracle() {
         if (L.done) return;
         L.active = true;
         L.start = simTime - L.pos;
+        L.base = L.start;
+        L.k = 0;
         L.aidx = activeList.length;
         activeList.push(L);
     }
@@ -63,29 +74,65 @@ function makeOracle() {
         removeFromActive(L);
     }
     function reverse(L) { if (!L.alloc) return; L.reversed = !L.reversed; }
+    function seek(L, p) {
+        if (!L.alloc) return;                       // stale/disposed -- no-op
+        const dur = L.dur;
+        if (p < 0) p = 0; else if (p > dur) p = dur;
+        L.pos = p;
+        L.start = simTime - p;
+        L.base = L.start;
+        L.k = 0;
+        if (p < dur) L.done = false;                // clears DONE iff p < dur
+    }
+    function restart(L) {
+        if (!L.alloc) return;
+        seek(L, 0);
+        start(L);
+    }
     function dispose(L) {
         if (!L.alloc) return;
         if (L.active) removeFromActive(L);
         L.alloc = false; L.active = false; L.done = false; L.cb = undefined; L.pos = 0;
+        L.gen = (L.gen + 1) >>> 0;                   // retire this token
     }
-    function advance(dt) {
-        if (!Number.isFinite(dt) || dt < 0) throw new RangeError("oracle dt");
+    function setTimeScale(v) { timeScale = v; }
+    function advanceBy(delta) {
         if (advancing) throw new LiteClockReentrancyError();
         advancing = true;
-        if (dt === 0) {
-            try { /* dt=0 tick: no completions */ } finally { advancing = false; }
+        if (delta === 0) {
+            try { /* dt=0 tick: compaction skipped, no completions */ } finally { advancing = false; }
             return;
         }
-        simTime = simTime + dt;
-        const queue = [];
+        simTime = simTime + delta;
+        const queue = [];      // parallel {L, cycles, gen}
         let writeIdx = 0;
         const ac = activeList.length;
         for (let readIdx = 0; readIdx < ac; readIdx = (readIdx + 1) | 0) {
             const L = activeList[readIdx];
             const elapsed = simTime - L.start;
-            if (elapsed >= L.dur) {
-                L.pos = L.dur; L.done = true; L.active = false; L.aidx = -1;
-                if (L.cb !== undefined) queue.push(L);
+            const dur = L.dur;
+            if (elapsed >= dur) {
+                if (L.loop || L.pingPong) {
+                    // Mirror limitation: this branch reuses the engine's exact
+                    // carry expressions, so a bug INSIDE the shared expression
+                    // is invisible to the fuzz by construction. t0's non-dyadic
+                    // dt-split cases and the t9 naive-carry control carry that
+                    // burden on the real engine.
+                    const cycles = Math.floor(elapsed / dur);
+                    if (cycles >= 1) {
+                        let k = L.k + cycles;
+                        if (k >= 0x40000000) { L.base = L.base + k * dur; k = 0; }
+                        L.start = L.base + k * dur;
+                        L.k = k;
+                        L.pos = simTime - L.start;
+                        if (L.pingPong && (cycles & 1) === 1) L.reversed = !L.reversed;
+                        if (L.cb !== undefined) queue.push({ L: L, cycles: cycles, gen: L.gen });
+                    }
+                    activeList[writeIdx] = L; L.aidx = writeIdx; writeIdx = (writeIdx + 1) | 0;
+                } else {
+                    L.pos = dur; L.done = true; L.active = false; L.aidx = -1;
+                    if (L.cb !== undefined) queue.push({ L: L, cycles: 1, gen: L.gen });
+                }
             } else {
                 L.pos = elapsed;
                 activeList[writeIdx] = L; L.aidx = writeIdx; writeIdx = (writeIdx + 1) | 0;
@@ -97,18 +144,28 @@ function makeOracle() {
             /* no frame signal to propagate */
         } finally {
             for (let i = 0; i < drainN; i = (i + 1) | 0) {
-                const L = queue[i];
-                if (L.done && L.cb !== undefined) {
+                const entry = queue[i];
+                const L = entry.L;
+                const n = entry.cycles;
+                for (let c = 0; c < n; c = (c + 1) | 0) {
+                    // gen + cb re-check BEFORE every fire, mirroring the engine.
+                    if (L.gen !== entry.gen || L.cb === undefined) break;
                     try { L.cb(); } catch (e) { /* isolate, like the engine drain */ }
                 }
             }
             advancing = false;
         }
     }
+    function advance(dt) {
+        if (!Number.isFinite(dt) || dt < 0) throw new RangeError("oracle dt");
+        const sdt = dt * timeScale;
+        if (!Number.isFinite(sdt)) throw new RangeError("oracle overflow");
+        advanceBy(sdt);
+    }
     function advanceTo(t) {
         if (!Number.isFinite(t)) throw new RangeError("oracle t");
         if (t < simTime) throw new RangeError("oracle t<simTime");
-        advance(t - simTime);
+        advanceBy(t - simTime);                      // absolute + unscaled
     }
     return {
         advance: advance,
@@ -116,6 +173,7 @@ function makeOracle() {
         get simTime() { return simTime; },
         createLane: createLane,
         start: start, pause: pause, reverse: reverse, dispose: dispose,
+        seek: seek, restart: restart, setTimeScale: setTimeScale,
         positionPeek: function (L) { return L.reversed ? (L.dur - L.pos) : L.pos; },
         tPeek: function (L) { const r = L.pos / L.dur; return L.reversed ? (1 - r) : r; },
         donePeek: function (L) { return L.done; }
@@ -209,10 +267,17 @@ function createRecord(rng) {
         rec.cbTarget = (live.length > 0) ? live[rng() % live.length] : null;
     }
 
+    // ~25% of new lanes cycle: 13% loop, 12% pingPong. Callback-created lanes
+    // (CB_CREATE_OTHER path) stay one-shot.
+    let mode = 0;
+    const moderoll = rng() % 100;
+    if (moderoll < 13) mode = "loop";
+    else if (moderoll < 25) mode = "pingPong";
+
     const engCb = cbType === CB_NONE ? undefined : makeCb(rec, true);
     const oraCb = cbType === CB_NONE ? undefined : makeCb(rec, false);
-    rec.eTok = engine.createLane(dur, engCb);
-    rec.oTok = oracle.createLane(dur, oraCb);
+    rec.eTok = engine.createLane(dur, engCb, mode);
+    rec.oTok = oracle.createLane(dur, oraCb, mode);
     recs.push(rec);
     addToLive(rec);
     return rec;
@@ -293,7 +358,7 @@ export async function run() {
         for (let op = 0; op < OPS; op = (op + 1) | 0) {
             const roll = rng() % 100;
 
-            if (roll < 35) {
+            if (roll < 30) {
                 // ADVANCE
                 let dt;
                 if (rng() % 15 === 0) dt = 0;
@@ -311,7 +376,7 @@ export async function run() {
                 pairPending(op);
                 compareAfterAdvance(op, "advance");
                 advances = (advances + 1) | 0;
-            } else if (roll < 45) {
+            } else if (roll < 40) {
                 // ADVANCE_TO
                 const delta = (rng() % 60) + ((rng() % 2 === 0) ? 0 : 0.5);
                 const target = engine.simTime + delta;
@@ -327,21 +392,37 @@ export async function run() {
                 pairPending(op);
                 compareAfterAdvance(op, "advanceTo");
                 advances = (advances + 1) | 0;
-            } else if (roll < 63) {
+            } else if (roll < 55) {
                 // LANE create (respect the live cap)
                 if (live.length < MAX_LIVE) createRecord(rng);
-            } else if (roll < 76) {
+            } else if (roll < 65) {
                 // START
                 const rec = pickAlive(rng);
                 if (rec !== null) { engine.start(rec.eTok); oracle.start(rec.oTok); }
-            } else if (roll < 84) {
+            } else if (roll < 72) {
                 // PAUSE
                 const rec = pickAlive(rng);
                 if (rec !== null) { engine.pause(rec.eTok); oracle.pause(rec.oTok); }
-            } else if (roll < 90) {
+            } else if (roll < 77) {
                 // REVERSE
                 const rec = pickAlive(rng);
                 if (rec !== null) { engine.reverse(rec.eTok); oracle.reverse(rec.oTok); }
+            } else if (roll < 82) {
+                // SEEK -- finite position incl. out-of-range (exercise clamp)
+                const rec = pickAlive(rng);
+                if (rec !== null) {
+                    const p = ((rng() % 800) - 100) + (((rng() % 2) === 0) ? 0 : 0.5);
+                    engine.seek(rec.eTok, p); oracle.seek(rec.oTok, p);
+                }
+            } else if (roll < 87) {
+                // RESTART
+                const rec = pickAlive(rng);
+                if (rec !== null) { engine.restart(rec.eTok); oracle.restart(rec.oTok); }
+            } else if (roll < 92) {
+                // SET_TIMESCALE from a fixed small set (0 is a legal freeze)
+                const TS = [0, 0.25, 1, 2, 4];
+                const v = TS[rng() % 5];
+                engine.setTimeScale(v); oracle.setTimeScale(v);
             } else {
                 // DISPOSE
                 const rec = pickAlive(rng);
@@ -386,10 +467,18 @@ function wrapEngine(c) {
         advance: function (dt) { c.advance(dt); },
         advanceTo: function (t) { c.advanceTo(t); },
         get simTime() { return c.simTime; },
-        createLane: function (dur, cb) { return c.lane({ duration: dur, onComplete: cb }); },
+        createLane: function (dur, cb, mode) {
+            const opts = { duration: dur, onComplete: cb };
+            if (mode === "loop") opts.loop = true;
+            else if (mode === "pingPong") opts.pingPong = true;
+            return c.lane(opts);
+        },
         start: function (h) { h.start(); },
         pause: function (h) { h.pause(); },
         reverse: function (h) { h.reverse(); },
+        seek: function (h, p) { h.seek(p); },
+        restart: function (h) { h.restart(); },
+        setTimeScale: function (v) { c.timeScale = v; },
         dispose: function (h) { h.dispose(); },
         positionPeek: function (h) { return h.positionPeek(); },
         tPeek: function (h) { return h.tPeek(); },

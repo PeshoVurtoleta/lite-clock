@@ -106,7 +106,9 @@ will build on for netcode replay.
 - **One force-propagate frame signal** per clock; lane reads pull from
   TypedArrays so 10K lanes cost one signal write per tick
 - **Deterministic `advance(dt)`** -- the only mutation entry point. Validates
-  `Number.isFinite(dt) && dt >= 0`. `dt=0` still ticks the frame signal
+  `Number.isFinite(dt) && dt >= 0`, then scales once by `clock.timeScale`
+  (0 is a legal freeze; `advanceTo` is absolute and unscaled). `dt=0` still
+  ticks the frame signal
 - **In-place active-list compaction**: completed lanes drop out of the hot
   loop without an extra pass
 - **End-of-tick onComplete drain**: callbacks fire AFTER signal propagation,
@@ -116,6 +118,9 @@ will build on for netcode replay.
 - **Tick-source helpers**: `attachRAF()`, `attachInterval(ms)`, `detach()`.
   Manual `advance(dt)` for deterministic tests
 - **Reverse mode** that flips reporting without complicating the hot loop
+- **Timeline surface (1.3.0)**: `lane.seek()`/`restart()` authored edits,
+  `loop`/`pingPong` lanes with a bit-exact overshoot carry (`onComplete` once
+  per cycle), and `clock.stats(out?)` counters with a zero-alloc sink form
 - **Terminal, idempotent `dispose()`** that returns the frame signal's node to
   the lite-signal pool (no registry leak) and fails closed on later mutation
 - **MIT licensed**, ASCII-only source, [zero `any`](./Clock.d.ts)
@@ -155,7 +160,9 @@ high-scale reactive systems.
 
 ## Compile pipeline
 
-`createClock(config)` performs all setup up front and returns a frozen handle:
+`createClock(config)` performs all setup up front (with one 1.3.0 exception:
+the cycling-lane and drain-scratch arrays materialize lazily at first use --
+see the block below) and returns a frozen handle:
 
 ```
 config validation         unknown keys throw (did-you-mean hint)
@@ -165,12 +172,23 @@ config validation         unknown keys throw (did-you-mean hint)
 SOA allocation             Float64Array startTimes
                            Float64Array durations
                            Float64Array positions
-                           Uint8Array   flags        (ALLOC|ACTIVE|DONE|REVERSE)
+                           Uint8Array   flags        (ALLOC|ACTIVE|DONE|REVERSE|LOOP|PINGPONG)
                            Uint16Array  activeList   (packed IDs, len activeCount)
                            Int32Array   activeIndex  (-1 sentinel for "not in list")
                            Array        onCompleteFns (sparse JS array)
                            Uint16Array  completedIds (end-of-tick scratch)
+                           Uint32Array  generations  (per-slot ABA tags)
                            Uint16Array  freeList     (stack of free IDs)
+                          --------------------------------------
+lazy SOA (1.3.0)           NOT allocated by createClock. Materialized once per
+                           clock at first use, so a bare createClock()/dispose()
+                           cycle allocates nothing beyond 1.2.0:
+                           Uint32Array  completedCycles + completedGens
+                                        (drain scratch -- first lane() call)
+                           Float64Array baseStartTimes (cycle-carry base --
+                                        first loop/pingPong lane)
+                           Uint32Array  cycleCounts  (completed cycles per
+                                        lane -- first loop/pingPong lane)
                           --------------------------------------
 free-list seed             freeList[i] = capacity - 1 - i
                            (so pop yields IDs 0, 1, 2, ... in order)
@@ -200,14 +218,18 @@ sequenceDiagram
 
     U->>C: clock.advance(16.67)
     C->>C: validate Number.isFinite(dt) && dt >= 0
+    C->>C: dt *= timeScale (overflow fails closed)
     C->>C: simTime += dt, tickCount++
     C->>L: iterate activeList[0..activeCount)
     loop per active lane
         L->>L: elapsed = simTime - startTimes[id]
-        alt elapsed >= duration
+        alt elapsed >= duration, loop / pingPong lane
+            L->>L: k += cycles; start = base + k*dur (bit-exact carry)
+            L->>L: queue (id, cycles, gen); stays active
+        else elapsed >= duration, plain lane
             L->>L: positions[id] = duration
             L->>L: flags[id] |= DONE, &= ~ACTIVE
-            L->>L: completedIds[completedCount++] = id
+            L->>L: queue (id, 1, gen)
         else
             L->>L: positions[id] = elapsed
             L->>L: writeBack(activeList, id)
@@ -217,7 +239,7 @@ sequenceDiagram
     C->>F: frameSig.set(simTime)
     F-->>U: effects re-run (lane.done() sees DONE)
     C->>CB: drain completedIds
-    loop per completed lane with callback
+    loop per queued lane, once per cycle (generation re-checked before each fire)
         CB-->>U: onComplete()
     end
 ```
@@ -239,7 +261,9 @@ Key invariants:
    `finally`, so a queued completion is never dropped even if a re-entering
    effect throws.
 5. **dt=0 still ticks.** The frame signal still propagates; subscribers see
-   the call. This matters for paused-but-observable simulations.
+   the call. This matters for paused-but-observable simulations -- and it is
+   exactly what `timeScale = 0` produces: every advance becomes a dt=0 tick
+   that propagates and completes nothing.
 6. **Stale handles are ABA-proof.** Every slot carries a `Uint32` generation
    tag, bumped on every disposal. A `Lane` stamps the tag at `lane()` and
    compares first on every method and read, so a handle to a freed-and-reused
@@ -251,6 +275,13 @@ Key invariants:
    reads return the frozen `simTime` (a number, never `undefined`). The disposed
    check runs BEFORE the re-entrancy check, so a dead clock always throws
    `LiteClockDisposedError`, never `LiteClockReentrancyError`.
+8. **The cycle carry is bit-exact.** A loop/pingPong lane crossing its
+   duration recomputes its effective start from a stored base and an integer
+   cycle count (`base + k*duration`, one rounding) instead of accumulating
+   floats, so any dt partition reaching the same total yields bit-identical
+   state AND identical per-cycle `onComplete` fire counts (gated in torture
+   t0; the accumulating variant is torture control #5 and demonstrably
+   diverges).
 
 ---
 
@@ -296,8 +327,11 @@ Validation (fails closed):
 clock.advance(dt: number): void;
 ```
 
-The only mutation entry point. Validates `Number.isFinite(dt) && dt >= 0`.
-`dt=0` still ticks the frame signal.
+The only mutation entry point. Validates `Number.isFinite(dt) && dt >= 0` on
+the RAW dt, then scales once at entry: `sdt = dt * timeScale`. A finite
+product that overflows to non-finite throws `RangeError` naming both inputs.
+`dt=0` (raw or scaled -- `timeScale = 0` lands here) still ticks the frame
+signal and completes nothing.
 
 ### clock.advanceTo
 
@@ -306,14 +340,36 @@ clock.advanceTo(t: number): void;
 ```
 
 Advance simTime to absolute `t`. Throws if `t < simTime`. `t === simTime`
-is a no-op tick (dt=0 behavior).
+is a no-op tick (dt=0 behavior). advanceTo is ABSOLUTE and UNSCALED: it
+reaches `t` exactly at any `timeScale`, 0 included (an explicit destination
+overrides the freeze). The identity `advanceTo(t) === advance(t - simTime)`
+holds only at `timeScale === 1`.
+
+### clock.timeScale
+
+```ts
+clock.timeScale;          // get: current multiplier, default 1
+clock.timeScale = 0.5;    // set: slow motion; 0 freezes; 2 fast-forwards
+```
+
+Clock-wide rate multiplier applied to `advance(dt)` once at entry. The setter
+fails closed: a non-finite, negative, or non-number value throws `RangeError`
+(`"clock.timeScale: must be a finite non-negative number (got X)"`); setting
+on a disposed clock throws `LiteClockDisposedError`. The getter never throws
+and returns the frozen value after dispose. Setting mid-tick is legal and
+takes effect at the next `advance()`. `attachRAF`/`attachInterval` drive the
+public `advance()`, so wall-clock dts ARE scaled -- attach a rAF source and
+set `timeScale = 0.25` for slow motion. timeScale is replay state: the same
+sequence of assignments and advances replays identically.
 
 ### clock.lane
 
 ```ts
 const lane = clock.lane({
     duration: number;           // > 0
-    onComplete?: () => void;    // fires once at duration, end-of-tick
+    onComplete?: () => void;    // fires once per completed cycle, end-of-tick
+    loop?: boolean;             // wrap at duration; never DONE
+    pingPong?: boolean;         // wrap + flip reported direction each cycle
 });
 ```
 
@@ -323,16 +379,28 @@ did-you-mean hint (`onComplte` -> `"did you mean 'onComplete'?"`). Throws
 With `growable: true`, doubles up to 65534 -- the final growth step clamps to
 the ceiling, so 65534 is reachable from any starting capacity.
 
-### lane.start / pause / reverse / dispose
+`loop` and `pingPong` must be exactly booleans when present (`TypeError`
+otherwise) and are mutually exclusive -- both true throws
+`"clock.lane: loop and pingPong are mutually exclusive"`. A cycling lane is
+never DONE: `done()` reports `false` for its whole life, `t()` cycles in
+`[0, 1)` (a `seek(duration)` edit parks it at exactly 1 until the next
+advance), and `onComplete` fires once per completed cycle -- a single advance
+spanning N cycles fires it N times (clamp pathological dts upstream; the
+attach helpers produce bounded ones). pingPong flips the same REVERSE flag
+`reverse()` toggles, so the two compose.
+
+### lane.start / pause / reverse / seek / restart / dispose
 
 ```ts
 lane.start();      // begin advancing (or resume from pause)
 lane.pause();      // stop advancing; preserves position
 lane.reverse();    // toggle direction-of-reporting for position()/t()
+lane.seek(p);      // authored edit: clamp to [0, duration] and jump there
+lane.restart();    // seek(0) + start() -- the replay primitive
 lane.dispose();    // free the slot back to the pool
 ```
 
-All four are idempotent. `dispose()` removes the lane from the active list
+start/pause/reverse/dispose are idempotent. `dispose()` removes the lane from the active list
 if active, frees the slot, clears any registered `onComplete`, and bumps the
 slot's `Uint32` generation tag.
 
@@ -347,6 +415,21 @@ do NOT touch the frame signal, so a stale read inside an `effect` creates no
 reactive dependency. `Uint32` pushes a generation wrap past two years of
 continuous single-slot churn. Stale means stale: a handle from a freed slot
 never touches the slot's next tenant.
+
+`seek(p)` is an authored EDIT, not time (see
+[`decisions/0003-seek.md`](./decisions/0003-seek.md)): it clamps a finite `p`
+to `[0, duration]`, re-bases the cycle carry, and clears DONE iff the new
+position is below duration. It NEVER starts a stopped lane (a DONE lane
+seeked below duration becomes PAUSED at `p`), NEVER fires `onComplete`, NEVER
+sets DONE, and NEVER ticks the frame signal -- peeks see the new position
+immediately, tracked reads pull it on the next tick. A non-finite `p` throws
+`RangeError` on a live handle; a stale handle stays a TRUE silent no-op even
+for garbage input (the stale check runs first). `seek(duration)` parks the
+lane AT its duration without completing it: completion is advance-exclusive
+and needs a compaction pass, so a following `advance(0)` completes nothing
+while any `advance(dt > 0)` completes it. `restart()` re-bases an ACTIVE lane
+to 0 without leaving the active list, and clears-and-runs a finished one --
+use it instead of the old dispose-and-reallocate replay pattern.
 
 ### lane.position / t / done
 
@@ -433,6 +516,23 @@ clock.activeCount;    // number of currently-active lanes
 Plain getters. Not signals -- if you need to react to changes, use
 `clock.frame()`.
 
+### clock.stats
+
+```ts
+clock.stats(): ClockStats;          // allocating convenience form
+clock.stats(out): ClockStats;       // fills `out` in place -- zero allocation
+```
+
+Seven counter fields: `poolUsed`, `poolFree`, `peakActive` (high-water
+active-lane count, monotone), `totalTicks`, `totalCompletions` (completed
+CYCLES -- a multi-cycle advance counts them all, callback-less lanes count
+too), `capacity`, `timeScale`. With `out` present it must be a non-null
+object (else `TypeError`); the sink is filled and returned with zero
+allocation (gated in torture t6's churn window), so it is safe in a HUD loop.
+Without `out` a fresh object is allocated -- the documented convenience form.
+stats stays readable after `dispose()`: counters and timeScale freeze, and
+the pool reads as empty (dispose retires every lane). Feeds `lite-devtools`.
+
 ### LiteClockCapacityError
 
 ```ts
@@ -487,16 +587,21 @@ to observe the "I am paused" tick (e.g. UI showing "PAUSED" overlay).
 ### `lane.start()` after completion is a no-op
 
 Once `flags & DONE` is set, `start()` won't reactivate the lane. To replay,
-`dispose()` and allocate a fresh lane. This is intentional -- the alternative
-(reset on start) makes lane handles ambiguous and breaks `done()` semantics.
+call `restart()` (1.3.0) -- or `seek()` below the duration and `start()`.
+This is intentional -- the alternative (reset on start) makes lane handles
+ambiguous and breaks `done()` semantics; `seek` clears DONE explicitly,
+which keeps the ambiguity out of `start()`.
 
 ### Reverse only affects reporting
 
 The engine advances `elapsed` forward always. `reverse()` flips what
 `position()`, `t()`, and `positionPeek()`/`tPeek()` return. **Completion still
 fires when forward elapsed reaches duration** -- a reversed lane "rewinds to
-start" and completes at `t === 0`. Ping-pong / loop modes are roadmap items
-that would change this; see [`ROADMAP.md`](./ROADMAP.md).
+start" and completes at `t === 0`. As of 1.3.0, `pingPong` builds on exactly
+this: each completed cycle flips the same REVERSE flag, so the reported
+trajectory is a triangle wave while the engine still only ever advances
+forward. A user `reverse()` on a pingPong lane composes -- both toggle the
+one flag.
 
 ### Pool reuse is LIFO
 

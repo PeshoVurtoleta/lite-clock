@@ -55,7 +55,7 @@ test("config-law: junk lane key lists known keys", () => {
     assert.throws(
         () => c.lane({ duration: 10, frobnicate: true }),
         (e) => e instanceof TypeError
-            && e.message === "clock.lane: unknown option 'frobnicate' (known keys: duration, onComplete)"
+            && e.message === "clock.lane: unknown option 'frobnicate' (known keys: duration, onComplete, loop, pingPong)"
     );
 });
 

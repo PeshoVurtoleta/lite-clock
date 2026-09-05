@@ -137,9 +137,14 @@ async function gateAllocDisposeChurn() {
     const c = createClock();
     for (let i = 0; i < WARM; i = (i + 1) | 0) { const l = c.lane({ duration: 1000 }); l.dispose(); }
 
+    // Preallocated stats sink: stats(out) must fill it with zero allocation.
+    const out = {};
     const s = await measure(function (gc) {
         for (let i = 0; i < HOT; i = (i + 1) | 0) {
             const l = c.lane({ duration: 1000 });
+            l.seek(500);            // authored edit -- cold, zero-alloc
+            l.restart();            // seek(0) + start -- cold, zero-alloc
+            c.stats(out);           // fill the sink in place -- zero-alloc
             l.dispose();
             if ((i & 8191) === 0) heapSample(gc, false);
         }

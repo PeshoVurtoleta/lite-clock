@@ -1,6 +1,6 @@
 # @zakkster/lite-clock
 
-Version: 1.2.0
+Version: 1.3.0
 
 Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray
 lane pool. Deterministic `advance(dt)` -- the only mutation entry point.
@@ -69,7 +69,22 @@ so even a rethrowing effect fires the queue and leaves the clock usable.
 ### `clock.advanceTo(t: number): void`
 
 Advance simTime to absolute `t`. Throws if `t < simTime`. `t === simTime` is
-a no-op tick (dt=0 behavior).
+a no-op tick (dt=0 behavior). advanceTo is ABSOLUTE and UNSCALED: it reaches
+`t` exactly at any `timeScale` (0 included -- an explicit destination overrides
+the freeze). The 1.2.0 identity `advanceTo(t) === advance(t - simTime)` now
+holds only at `timeScale === 1`.
+
+### `clock.timeScale: number` (accessor)
+
+Clock-wide rate multiplier, default 1. The getter never throws (read surface;
+frozen value after dispose). The setter fails closed: on a disposed clock it
+throws `LiteClockDisposedError`; a value that is not a finite number >= 0 throws
+`RangeError` ("clock.timeScale: must be a finite non-negative number (got X)").
+`0` is legal -- a true freeze in which `advance()` still ticks and propagates
+the frame signal but completes nothing. `advance(dt)` scales the raw dt once at
+entry (`dt * timeScale`); a finite product that overflows to non-finite throws
+`RangeError` naming both `dt` and `timeScale`. Setting mid-tick is legal and
+takes effect at the next `advance`. timeScale is replay state.
 
 ### `clock.lane(opts): Lane`
 
@@ -77,12 +92,35 @@ Allocate a new lane from the pool.
 
 Opts:
 - `duration: number` -- > 0, in sim-time units (typically ms)
-- `onComplete?: () => void` -- fires once in the end-of-tick queue
+- `onComplete?: () => void` -- fires once per completed cycle in the end-of-tick
+  queue (loop/pingPong lanes fire it once per wrap)
+- `loop?: boolean` -- when true the lane wraps at `duration` and never becomes
+  DONE. Must be exactly a boolean when present (`TypeError` otherwise).
+- `pingPong?: boolean` -- when true the lane wraps and flips reported direction
+  every cycle (triangle wave). Must be exactly a boolean when present.
+
+`loop` and `pingPong` are mutually exclusive: both true throws `TypeError`
+("clock.lane: loop and pingPong are mutually exclusive"). Validation order:
+shape -> unknown keys -> duration -> onComplete -> loop -> pingPong -> mutual
+exclusion.
 
 An unknown opts key throws `TypeError` with a did-you-mean hint
 ("clock.lane: unknown option 'onComplte' -- did you mean 'onComplete'?").
 
 Throws `LiteClockCapacityError` if the pool is exhausted and `growable: false`.
+
+### loop / pingPong lanes
+
+A loop or pingPong lane is never DONE: `done()`/`donePeek()` report `false` for
+its whole life, and `t()` cycles in `[0, 1)` (a `seek(duration)` edit parks it
+at exactly 1 until the next advance). On any advance whose scaled dt
+carries the lane past `duration`, the carry is recomputed from a stored base
+(`startTimes = baseStartTimes + k*dur`, one rounding), so any dt partition
+reaching the same total yields bit-identical positions/flags/cycleCounts.
+`onComplete` fires once per completed cycle, including when a single dt spans
+many cycles. There is no cap -- clamp pathological dts upstream; attachRAF/
+attachInterval produce bounded dts. pingPong flips the same REVERSE flag that
+`reverse()` toggles, so the two compose.
 
 ### `Lane` (handle)
 
@@ -90,6 +128,17 @@ Methods:
 - `start()` -- begin advancing (or resume from a pause). Idempotent.
 - `pause()` -- stop advancing; snapshots `positions[id] = elapsed`. Idempotent.
 - `reverse()` -- toggle direction-of-reporting for position()/t(). Idempotent.
+- `seek(p)` -- authored edit: clamp `p` to `[0, duration]` and jump there.
+  Throws `RangeError` on a non-finite `p` (validation before clamp, on a live
+  handle). seek NEVER starts a stopped lane (a DONE lane seeked below duration
+  becomes PAUSED at `p`), NEVER fires onComplete, NEVER sets DONE, NEVER ticks
+  the frame signal -- peeks see the new position immediately; tracked reads pull
+  on the next tick. `seek(duration)` leaves position == duration WITHOUT
+  completing: completion is advance-exclusive and needs a compaction pass, so a
+  following `advance(0)` does NOT complete it while any `advance(dt > 0)` does.
+- `restart()` -- seek to 0, then start. Re-bases an ACTIVE lane to 0 (stays
+  active); clears DONE and runs a finished lane. Replaces the dispose/realloc
+  replay pattern.
 - `dispose()` -- free the slot back to the pool. Idempotent. Subsequent method
   calls on the handle are TRUE silent no-ops: the slot's generation is bumped on
   dispose, so a handle to a freed-and-reused slot proves stale (generation
@@ -126,8 +175,10 @@ Force-propagates on every advance (even dt=0).
 
 ### `clock.attachRAF(): void`
 
-Drive from `requestAnimationFrame`. Computes dt from the rAF timestamp.
-Throws if rAF is not available (e.g. plain Node).
+Drive from `requestAnimationFrame`. Computes dt from the rAF timestamp and
+calls the public `advance()`, so wall-clock dts ARE scaled by `timeScale` --
+this is the intended slow-motion / fast-forward semantic. Throws if rAF is not
+available (e.g. plain Node).
 
 ### `clock.attachInterval(ms: number): void`
 
@@ -167,6 +218,20 @@ one slot from the lite-signal default registry and the 1024th cycle hits
 ### `clock.activeCount: number` (read-only)
 
 Plain getters. Not signals -- if you need reactivity, track `clock.frame()`.
+
+### `clock.stats(out?): ClockStats`
+
+Snapshot of pool + counter state. With `out` present it must be a non-null
+object (else `TypeError`); it is filled and returned and allocates NOTHING (safe
+in a hot loop). With `out` absent it allocates and returns a fresh object. Stays
+readable after dispose (read surface; counters frozen). Fields, in order:
+- `poolUsed: number` -- capacity - freeTop
+- `poolFree: number` -- freeTop
+- `peakActive: number` -- high-water active-lane count
+- `totalTicks: number` -- tickCount
+- `totalCompletions: number` -- completed cycles (callback-less lanes count too)
+- `capacity: number`
+- `timeScale: number`
 
 ### `LiteClockCapacityError`
 

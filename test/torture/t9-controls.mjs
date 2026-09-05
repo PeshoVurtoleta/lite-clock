@@ -41,7 +41,14 @@ export async function run() {
             + "  stderr: " + tail(config.stderr, 400);
     });
 
+    const naiveCarry = spawnControl("naive-carry");
+    assert(naiveCarry.status !== 0, function () {
+        return "t9 control 'naive-carry' exited 0 (gate is decorative)\n"
+            + "  stdout: " + tail(naiveCarry.stdout, 400) + "\n"
+            + "  stderr: " + tail(naiveCarry.stderr, 400);
+    });
+
     console.log("t9 controls: pass (alloc exit=" + alloc.status
         + " leak exit=" + leak.status + " stale exit=" + stale.status
-        + " config exit=" + config.status + ")");
+        + " config exit=" + config.status + " naive-carry exit=" + naiveCarry.status + ")");
 }

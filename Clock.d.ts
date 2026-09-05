@@ -37,8 +37,28 @@ export interface ClockConfig {
 export interface LaneOptions {
     /** Lane duration in sim-time units (typically ms). Must be > 0. */
     duration: number;
-    /** Optional callback fired in the end-of-tick queue when the lane completes. */
+    /**
+     * Optional callback fired in the end-of-tick queue when the lane completes.
+     * A loop/pingPong lane fires it once per completed cycle (including when a
+     * single advance spans many cycles).
+     */
     onComplete?: () => void;
+    /**
+     * When true the lane wraps at `duration` and never becomes DONE
+     * (done()/donePeek() report false for its whole life; t() cycles in
+     * [0,1), except that a seek(duration) edit parks it at exactly 1 until
+     * the next advance). Must be exactly a boolean when present (TypeError
+     * otherwise). Mutually exclusive with `pingPong` (both true throws
+     * TypeError).
+     */
+    loop?: boolean;
+    /**
+     * When true the lane wraps at `duration` and flips reported direction every
+     * cycle (a triangle wave), and never becomes DONE. The flip toggles the same
+     * REVERSE flag reverse() controls, so the two compose. Must be exactly a
+     * boolean when present. Mutually exclusive with `loop`.
+     */
+    pingPong?: boolean;
 }
 
 /**
@@ -61,6 +81,31 @@ export interface Lane {
     pause(): void;
     /** Toggle direction-of-reporting for position() and t(). Stale: no-op. */
     reverse(): void;
+    /**
+     * Authored edit, NOT time: clamp `position` to [0, duration] and jump there.
+     * Re-bases the cycle carry and clears DONE iff the new position < duration.
+     * NEVER starts a stopped lane (a DONE lane seeked below duration becomes
+     * PAUSED at the new position), NEVER fires onComplete, NEVER sets DONE, and
+     * NEVER ticks the frame signal -- peeks see the new position immediately;
+     * tracked reads pull it on the next tick.
+     *
+     * seek(duration) leaves position == duration WITHOUT completing: completion
+     * is advance-exclusive and needs a compaction pass, so a following
+     * advance(0) does NOT complete the lane while any advance(dt > 0) does.
+     *
+     * A stale handle is a TRUE silent no-op even for garbage input (the stale
+     * check runs before validation). On a live handle a non-finite / non-number
+     * position throws RangeError.
+     *
+     * @throws {RangeError} Non-finite / non-number position on a live handle.
+     */
+    seek(position: number): void;
+    /**
+     * Seek to 0, then start. Re-bases an ACTIVE lane to 0 (stays active,
+     * activeCount unchanged); clears DONE and runs a finished lane. Replaces the
+     * dispose/realloc replay pattern. Stale: no-op.
+     */
+    restart(): void;
     /**
      * Free the lane slot back to the pool and bump the slot's generation.
      * Idempotent. After dispose the handle is stale: subsequent method calls
@@ -128,12 +173,23 @@ export interface Clock {
      * runs BEFORE the re-entrancy check, so a dead clock always throws
      * LiteClockDisposedError, never LiteClockReentrancyError.
      *
+     * The raw dt is scaled once at entry by `timeScale` (`dt * timeScale`); a
+     * finite product that overflows to non-finite throws RangeError naming both
+     * dt and timeScale. At timeScale 0 the scaled dt is 0 -- a true freeze that
+     * still ticks and propagates the frame signal but completes nothing.
+     *
      * @throws {LiteClockDisposedError}   advance on a disposed clock.
      * @throws {LiteClockReentrancyError} Re-entrant advance during a tick.
+     * @throws {RangeError} Invalid dt, or dt * timeScale overflows to non-finite.
      */
     advance(dt: number): void;
     /**
      * Advance simTime to absolute `t`. Throws if `t < simTime`.
+     *
+     * advanceTo is ABSOLUTE and UNSCALED: it reaches `t` exactly at any
+     * timeScale (0 included -- an explicit destination overrides the freeze).
+     * The identity `advanceTo(t) === advance(t - simTime)` holds only at
+     * `timeScale === 1`.
      *
      * @throws {LiteClockDisposedError}   advanceTo on a disposed clock.
      * @throws {LiteClockReentrancyError} Re-entrant advance during a tick.
@@ -144,6 +200,9 @@ export interface Clock {
      * Allocate a new lane. Throws LiteClockCapacityError if pool exhausted (no grow).
      *
      * @throws {LiteClockDisposedError} lane on a disposed clock.
+     * @throws {TypeError} Unknown option key (did-you-mean hint), a present
+     *                     non-boolean `loop`/`pingPong`, or both set true
+     *                     (mutually exclusive).
      */
     lane(opts: LaneOptions): Lane;
 
@@ -190,6 +249,56 @@ export interface Clock {
     readonly capacity: number;
     /** Number of currently-active lanes. */
     readonly activeCount: number;
+
+    /**
+     * Clock-wide rate multiplier applied to advance() dts once at entry
+     * (advanceTo is unscaled). Must be a finite number >= 0; 0 is a legal
+     * freeze in which advance() still ticks and propagates but completes
+     * nothing. Replay state: the same sequence of assignments and advances
+     * replays identically. Reading never throws (frozen value after dispose).
+     *
+     * @throws {RangeError} Assigning a non-finite, negative, or non-number value.
+     * @throws {LiteClockDisposedError} Assigning on a disposed clock.
+     */
+    timeScale: number;
+
+    /**
+     * Counter snapshot. With `out` (any non-null object) fills the 7 fields
+     * in place and returns it -- the zero-allocation form. Without `out`,
+     * allocates and returns a fresh object (the documented allocating
+     * convenience). Read surface: stays callable after dispose -- counters
+     * and timeScale are frozen; the pool reads as empty (dispose retires
+     * every lane).
+     *
+     * @throws {TypeError} `out` present but not an object.
+     */
+    stats(out?: Partial<ClockStats>): ClockStats;
+}
+
+// ---------------------------------------------------------------------------
+// Stats
+// ---------------------------------------------------------------------------
+
+/** Counter snapshot filled by clock.stats(). All fields are numbers. */
+export interface ClockStats {
+    /** Allocated lane slots (capacity - poolFree). */
+    poolUsed: number;
+    /** Free lane slots. */
+    poolFree: number;
+    /** High-water mark of simultaneously active lanes. Monotone; freezes at dispose. */
+    peakActive: number;
+    /** Total advance() calls (equals clock.ticks). */
+    totalTicks: number;
+    /**
+     * Total completed cycles: a plain completion counts 1, a loop/pingPong
+     * lane counts every cycle (a single multi-cycle advance counts them all),
+     * and lanes without an onComplete count too.
+     */
+    totalCompletions: number;
+    /** Current pool capacity. */
+    capacity: number;
+    /** Current timeScale. */
+    timeScale: number;
 }
 
 // ---------------------------------------------------------------------------

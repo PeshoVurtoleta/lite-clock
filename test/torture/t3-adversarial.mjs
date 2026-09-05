@@ -7,7 +7,7 @@
 // C-05 growth ceiling: a default-start growable clock reaches exactly 65534.
 
 import { createClock, LiteClockCapacityError } from "../../Clock.js";
-import { assert, assertEq } from "./harness.mjs";
+import { assert, assertEq, assertThrows, makeRng, SEED } from "./harness.mjs";
 
 // ---- preallocated side channels (allocated once, outside every loop) -------
 const N = 10000;
@@ -158,5 +158,86 @@ export async function run() {
         c.dispose();
     }
 
-    console.log("t3 adversarial: pass (10k same-tick order + re-arm chain 10k ticks; C-05 ceiling 65534 bit-exact)");
+    // ---- 10K loop cycles in ONE tick: exact fire count, exact final state --
+    // dur 1, one loop lane with a counting callback, advance(10000.5): exactly
+    // 10000 completed cycles fire once each, position lands at 0.5, and the
+    // whole ride finishes well under a second (no per-cycle allocation hang).
+    {
+        const c = createClock();
+        let fires = 0;
+        const l = c.lane({ duration: 1, loop: true, onComplete: function () { fires = (fires + 1) | 0; } });
+        l.start();
+        const t0 = Date.now();
+        c.advance(10000.5);
+        const elapsedMs = Date.now() - t0;
+        assertEq(fires, 10000, "t3 10k-cycle single tick fire count");
+        assertEq(l.positionPeek(), 0.5, "t3 10k-cycle single tick position");
+        assertEq(l.donePeek(), false, "t3 10k-cycle loop never done");
+        assert(elapsedMs < 1000, function () { return "t3 10k-cycle single tick too slow: " + elapsedMs + "ms"; });
+        c.dispose();
+    }
+
+    // ---- k-fold boundary: cross the Uint32 fold at 2^30 in one call --------
+    // dur 1, NO callback, advance(2^30 + 3.5) folds the cycle counter at 2^30
+    // (recompute-shaped, so path-independent). Position must land at 0.5, and a
+    // follow-up advance(0.25) must match a fresh-lane oracle at 0.75 bit-for-bit.
+    {
+        const c = createClock();
+        const l = c.lane({ duration: 1, loop: true });
+        l.start();
+        c.advance((2 ** 30) + 3.5);
+        assertEq(l.positionPeek(), 0.5, "t3 k-fold position after fold");
+        assertEq(l.donePeek(), false, "t3 k-fold loop never done");
+        c.advance(0.25);
+        const oc = createClock();
+        const ol = oc.lane({ duration: 1, loop: true });
+        ol.start();
+        oc.advance(0.75);
+        assertEq(l.positionPeek(), ol.positionPeek(), "t3 k-fold follow-up matches fresh-lane oracle");
+        c.dispose(); oc.dispose();
+    }
+
+    // ---- seek fails closed on non-finite (live handle) --------------------
+    {
+        const c = createClock();
+        const l = c.lane({ duration: 10 });
+        l.start();
+        assertThrows(function () { l.seek(NaN); }, RangeError, "seek", "t3 seek NaN throws");
+        assertThrows(function () { l.seek(Infinity); }, RangeError, "seek", "t3 seek Infinity throws");
+        c.dispose();
+    }
+
+    // ---- advance overflow guard at an extreme timeScale -------------------
+    // A finite dt times a finite timeScale can overflow to Infinity: fail closed.
+    {
+        const c = createClock();
+        c.timeScale = 1e10;
+        assertThrows(function () { c.advance(1e308); }, RangeError, "timeScale", "t3 advance overflow guard");
+        c.dispose();
+    }
+
+    // ---- timeScale=0 freeze under 1000 fuzzed dts -------------------------
+    // simTime stays bit-frozen at its pre-freeze value; ticks increments once
+    // per advance; no lane completes.
+    {
+        const c = createClock();
+        const l = c.lane({ duration: 5 });
+        l.start();
+        c.advance(2);                              // simTime now 2, position 2
+        c.timeScale = 0;
+        const frozen = c.simTime;
+        const ticksBefore = c.ticks;
+        const rng = makeRng(SEED);
+        for (let i = 0; i < 1000; i = (i + 1) | 0) {
+            const dt = (rng() % 10000) + (((rng() % 2) === 0) ? 0 : 0.5);
+            c.advance(dt);
+        }
+        assertEq(c.simTime, frozen, "t3 timeScale=0 simTime bit-frozen");
+        assertEq(c.ticks, ticksBefore + 1000, "t3 timeScale=0 ticks +1000");
+        assertEq(l.donePeek(), false, "t3 timeScale=0 completes nothing");
+        assertEq(l.positionPeek(), 2, "t3 timeScale=0 position frozen");
+        c.dispose();
+    }
+
+    console.log("t3 adversarial: pass (10k same-tick order + re-arm chain 10k ticks; C-05 ceiling 65534 bit-exact; 10k-cycle single tick; k-fold; seek/overflow/freeze guards)");
 }

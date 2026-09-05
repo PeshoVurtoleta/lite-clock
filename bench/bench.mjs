@@ -2,13 +2,15 @@
 //
 // Run with:    node --expose-gc bench/bench.mjs
 //
-// Six scenarios spanning the hot paths a real consumer hits:
+// Seven scenarios spanning the hot paths a real consumer hits:
 //   1. idle-advance         no active lanes; pure framing overhead per tick
 //   2. active-lanes-1k      1000 active lanes; SOA compaction at scale
 //   3. lane-reads           position/t/done reads inside an effect (reactive path)
 //   4. alloc-dispose-churn  pool reuse via lane()/dispose() cycles
 //   5. completion-fanout    many lanes completing in the same tick + onComplete
 //   6. attach-interval-once  one-time cost (sanity for the attach helpers)
+//   7. loop-cycle-100       100 loop lanes each completing a cycle per tick
+//                            (isolates the 1.3.0 completion-arm carry branch)
 //
 // Methodology:
 //   - Warm-up phase runs the hot path long enough for V8 to optimize.
@@ -156,6 +158,30 @@ console.log("\n@zakkster/lite-clock 1.0.0 -- bench (node --expose-gc)\n");
         c.detach();
         c.dispose();
     });
+}
+
+// ---------------------------------------------------------------------------
+// 7. loop-cycle-100: the 1.3.0 completion-arm carry branch, isolated.
+// 100 loop lanes with duration 1 advanced by exactly 1.0: every advance
+// completes one cycle per lane (100 carry recomputes per iter). Ten lanes
+// carry a counting onComplete so the queue + generation-guarded drain cost is
+// in the number too. Lanes are armed once OUTSIDE the measured fn -- unlike
+// completion-fanout this cell is not createClock-dominated.
+// ---------------------------------------------------------------------------
+{
+    let cycles = 0;
+    const onCycle = () => { cycles = (cycles + 1) | 0; };
+    const c = createClock({ capacity: 128 });
+    for (let i = 0; i < 100; i++) {
+        const l = c.lane(i < 10
+            ? { duration: 1, loop: true, onComplete: onCycle }
+            : { duration: 1, loop: true });
+        l.start();
+    }
+    measure("loop-cycle-100", 100, 10_000, () => { c.advance(1.0); });
+    c.dispose();
+    // Reference the counter so V8 cannot dead-store the callbacks.
+    if (cycles === -1) console.log("");
 }
 
 console.log("");

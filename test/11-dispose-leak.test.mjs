@@ -6,7 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { effect } from "@zakkster/lite-signal";
-import { createClock } from "../Clock.js";
+import { createClock, LiteClockDisposedError } from "../Clock.js";
 
 test("dispose: 4K create/dispose cycles do not leak lite-signal nodes", () => {
     // 4x the default registry capacity. If the frameSig leaks, this throws.
@@ -49,4 +49,34 @@ test("dispose: idempotent", () => {
     c.dispose();
     c.dispose();
     c.dispose();
+});
+
+test("dispose: C-06 -- a dead clock fails closed; frame() stays a number", () => {
+    // Fail-before (pre-K2 1.0.2): lane()/advance() "worked" on a disposed clock
+    // (zombie) and fired callbacks, while frame() returned undefined against a
+    // d.ts that says number. Pass-after: the mutation surface throws
+    // LiteClockDisposedError and frame()/frame.peek() return the frozen simTime.
+    const c = createClock();
+    c.advance(10);
+    c.dispose();
+    assert.throws(() => c.lane({ duration: 5 }), LiteClockDisposedError);
+    assert.throws(() => c.advance(1), LiteClockDisposedError);
+    assert.throws(() => c.advanceTo(20), LiteClockDisposedError);
+    assert.throws(() => c.attachInterval(100), LiteClockDisposedError);
+    assert.throws(() => c.frame.subscribe(() => {}), LiteClockDisposedError);
+    assert.equal(typeof c.frame(), "number");
+    assert.equal(c.frame(), 10);                  // frozen simTime, never undefined
+    assert.equal(typeof c.frame.peek(), "number");
+    assert.equal(c.frame.peek(), 10);
+});
+
+test("dispose: C-08 -- terminal; simTime/ticks freeze, not reset", () => {
+    // Fail-before (pre-K2 1.0.2): the d.ts claimed dispose() reset the counters;
+    // the code always froze them. The d.ts is corrected to terminal semantics.
+    const c = createClock();
+    c.advance(5);
+    c.advance(3);
+    c.dispose();
+    assert.equal(c.simTime, 8);                   // frozen at last value
+    assert.equal(c.ticks, 2);
 });

@@ -116,8 +116,8 @@ will build on for netcode replay.
 - **Tick-source helpers**: `attachRAF()`, `attachInterval(ms)`, `detach()`.
   Manual `advance(dt)` for deterministic tests
 - **Reverse mode** that flips reporting without complicating the hot loop
-- **Idempotent `dispose()`** that returns the frame signal's node to the
-  lite-signal pool (no registry leak)
+- **Terminal, idempotent `dispose()`** that returns the frame signal's node to
+  the lite-signal pool (no registry leak) and fails closed on later mutation
 - **MIT licensed**, ASCII-only source, [zero `any`](./Clock.d.ts)
 
 ---
@@ -229,11 +229,27 @@ Key invariants:
    drop out without a second pass.
 3. **Frame signal first, callbacks second.** Effects observing `lane.done()`
    see `true` BEFORE the `onComplete` callback fires.
-4. **Re-entrant safe.** `onComplete` callbacks may call `clock.lane()`,
-   `clock.advance()`, or any clock method. The active loop has finished by
-   the time they run, so mutating activeList is fine.
+4. **The tick is atomic.** Compaction -> frame propagation -> onComplete drain
+   is one indivisible tick. A callback, effect, or subscriber may call
+   `clock.lane()`, `clock.dispose()`, `pause()`, `start()`, `reverse()`,
+   `attachInterval()`, or `detach()` -- all legal. Calling `clock.advance()` or
+   `clock.advanceTo()` AGAIN during the tick throws `LiteClockReentrancyError`;
+   schedule follow-up advances for the next frame. The drain runs in a
+   `finally`, so a queued completion is never dropped even if a re-entering
+   effect throws.
 5. **dt=0 still ticks.** The frame signal still propagates; subscribers see
    the call. This matters for paused-but-observable simulations.
+6. **Stale handles are ABA-proof.** Every slot carries a `Uint32` generation
+   tag, bumped on every disposal. A `Lane` stamps the tag at `lane()` and
+   compares first on every method and read, so a handle to a freed-and-reused
+   slot proves stale and takes the inert path -- it never drives or observes the
+   next tenant. The silent-no-op promise is now enforced, not merely documented.
+7. **A dead clock fails closed.** `clock.dispose()` is terminal. The mutation
+   surface (`advance`, `advanceTo`, `lane`, `attachRAF`, `attachInterval`,
+   `frame.subscribe`) throws `LiteClockDisposedError`; `simTime`/`ticks` freeze;
+   reads return the frozen `simTime` (a number, never `undefined`). The disposed
+   check runs BEFORE the re-entrancy check, so a dead clock always throws
+   `LiteClockDisposedError`, never `LiteClockReentrancyError`.
 
 ---
 
@@ -242,12 +258,19 @@ Key invariants:
 ### Top-level
 
 ```ts
-import { createClock, LiteClockCapacityError } from "@zakkster/lite-clock";
+import {
+    createClock,
+    LiteClockCapacityError,
+    LiteClockReentrancyError,
+    LiteClockDisposedError
+} from "@zakkster/lite-clock";
 ```
 
 Exports:
 - `createClock(config?)` -- factory
 - `LiteClockCapacityError` -- thrown on pool exhaustion
+- `LiteClockReentrancyError` -- thrown on re-entrant advance during a tick
+- `LiteClockDisposedError` -- thrown by the mutation surface of a disposed clock
 
 ### createClock
 
@@ -302,8 +325,20 @@ lane.dispose();    // free the slot back to the pool
 ```
 
 All four are idempotent. `dispose()` removes the lane from the active list
-if active, frees the slot, and clears any registered `onComplete`. Subsequent
-calls on the disposed handle are silent no-ops.
+if active, frees the slot, clears any registered `onComplete`, and bumps the
+slot's `Uint32` generation tag.
+
+Subsequent calls on the disposed handle are TRUE silent no-ops -- and this is
+now enforced, not merely promised. The pool free list is LIFO, so a disposed
+slot is reused immediately; a handle that only checked "is my slot allocated?"
+would drive and observe the new tenant (the pre-1.1.0 C-04 bug). Each handle
+stamps the slot's generation at `lane()` and compares it FIRST on every method
+and read. A generation mismatch is provably a stale handle: methods no-op,
+`position()`/`t()` return `0`, `done()` returns `false`, and the tracked reads
+do NOT touch the frame signal, so a stale read inside an `effect` creates no
+reactive dependency. `Uint32` pushes a generation wrap past two years of
+continuous single-slot churn. Stale means stale: a handle from a freed slot
+never touches the slot's next tenant.
 
 ### lane.position / t / done
 
@@ -334,6 +369,11 @@ clock.frame.subscribe(fn: (simTime: number) => void): Dispose;
 (`equals: () => false`) so every `advance()` notifies subscribers even when
 simTime didn't actually change (e.g. dt=0).
 
+On a disposed clock `frame()` and `frame.peek()` return the frozen `simTime`
+(a number, never `undefined`). `frame.subscribe` on a disposed clock THROWS
+`LiteClockDisposedError` -- a subscription on a dead clock could never fire
+again (every `advance()` throws), so a silent no-op subscriber would be a trap.
+
 ### clock.attachRAF / attachInterval / detach
 
 ```ts
@@ -353,11 +393,25 @@ process exit.
 clock.dispose();
 ```
 
-Returns the frame signal's node to the `lite-signal` pool, detaches any
-attached tick source, and resets the lane pool. Idempotent. **Required**
-for bounded-lifetime clocks (per game level, per route, per component mount)
--- without it, every `createClock()`/`dispose()` cycle leaks one slot from
-the lite-signal default registry.
+TERMINAL. Returns the frame signal's node to the `lite-signal` pool, detaches
+any attached tick source, and retires every lane (each slot's generation is
+bumped, so every outstanding handle proves stale). Idempotent.
+
+Dispose is terminal, NOT a reset. `simTime` and `ticks` FREEZE at their last
+values -- they do not rewind (reading a frozen count is more honest than a
+silently-rewound zero). After dispose the mutation surface fails closed:
+`advance`, `advanceTo`, `lane`, `attachRAF`, `attachInterval`, and
+`frame.subscribe` throw `LiteClockDisposedError`. `frame()` and `frame.peek()`
+return the frozen `simTime` (never `undefined`). `detach()` and `dispose()`
+stay idempotent no-ops. A `dispose()` from an effect/subscriber firing during a
+tick is legal: the in-flight tick completes, then the next mutation throws.
+
+**Migration** from a "reset and reuse" pattern: dispose means dispose. Create a
+new clock with `createClock()` instead of expecting counters to rewind.
+
+**Required** for bounded-lifetime clocks (per game level, per route, per
+component mount) -- without it, every `createClock()`/`dispose()` cycle leaks
+one slot from the lite-signal default registry.
 
 ### clock.simTime / ticks / capacity / activeCount
 
@@ -383,6 +437,34 @@ class LiteClockCapacityError extends Error {
 Thrown by `clock.lane()` when the pool is exhausted and growth would either
 violate `growable: false` or exceed the 65534 hard ceiling. Message names
 both escape hatches.
+
+### LiteClockReentrancyError
+
+```ts
+class LiteClockReentrancyError extends Error {
+    readonly name: "LiteClockReentrancyError";
+}
+```
+
+Thrown by `clock.advance()` / `clock.advanceTo()` when re-entered during a tick
+(from an `onComplete` callback, an effect tracking `frame()`, or a
+`frame.subscribe` subscriber). The tick is atomic; schedule follow-up advances
+for the next frame.
+
+### LiteClockDisposedError
+
+```ts
+class LiteClockDisposedError extends Error {
+    readonly name: "LiteClockDisposedError";
+}
+```
+
+Thrown by the mutation surface of a disposed clock -- `advance()`,
+`advanceTo()`, `lane()`, `attachRAF()`, `attachInterval()`, and
+`frame.subscribe()`. The disposed check runs BEFORE the re-entrancy check, so a
+dead clock always throws `LiteClockDisposedError`, never
+`LiteClockReentrancyError`. Reads never throw and never return `undefined`.
+`dispose()` is terminal; create a new clock with `createClock()`.
 
 ---
 
@@ -413,6 +495,17 @@ that would change this; see [`ROADMAP.md`](./ROADMAP.md).
 The free list is a stack: the most recently disposed slot is reused first.
 This isn't observable through the public API (lane IDs are internal), but
 it does mean cache locality is naturally maintained -- a hot slot stays hot.
+Because a disposed slot is reused immediately, a `Uint32` generation tag per
+slot makes a stale handle ABA-proof: it can never be mistaken for a live handle
+to the same slot's new tenant (see invariant 6 and `lane.dispose`).
+
+### `dispose()` is terminal, not a reset
+
+`clock.dispose()` freezes `simTime`/`ticks` and fails the mutation surface
+closed with `LiteClockDisposedError` (see invariant 7 and `clock.dispose`). A
+`dispose()` from a callback/effect firing mid-tick is legal: the in-flight tick
+completes, then the next mutation throws. To replay a timeline, create a new
+clock -- there is no rewind.
 
 ### onComplete throws are isolated
 

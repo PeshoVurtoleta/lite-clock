@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-clock",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray lane pool, deterministic advance(dt), single frame signal carrying simTime. Hits 10K concurrent lanes with zero per-frame allocation.",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "license": "MIT",
@@ -26,10 +26,11 @@
     "ROADMAP.md"
   ],
   "scripts": {
-    "test": "node --test --test-reporter=spec",
-    "test:gc": "node --expose-gc --test --test-reporter=spec",
+    "test": "node --test --test-reporter=spec \"test/*.test.mjs\"",
+    "test:gc": "node --expose-gc --test --test-reporter=spec \"test/*.test.mjs\"",
+    "torture": "node --expose-gc test/torture.mjs",
     "bench": "node --expose-gc bench/bench.mjs",
-    "verify": "npm test && npm run test:gc && npm run bench"
+    "verify": "npm test && npm run test:gc && npm run bench && npm run torture"
   },
   "keywords": [
     "clock",
@@ -69,6 +70,8 @@
     "@zakkster/lite-signal": "^1.2.2"
   },
   "devDependencies": {
-    "@zakkster/lite-signal": "^1.2.2"
+    "@zakkster/lite-gc-profiler": "^1.16.0",
+    "@zakkster/lite-leak": "^1.10.0",
+    "@zakkster/lite-signal": "^1.5.0"
   }
 }

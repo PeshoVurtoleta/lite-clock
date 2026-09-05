@@ -1,4 +1,4 @@
-// @zakkster/lite-clock 1.0.0
+// @zakkster/lite-clock 1.1.0
 // Zero-GC simulation/timeline engine for @zakkster/lite-signal.
 //
 // SOA TypedArray lane pool. Deterministic advance(dt) -- the only mutation
@@ -41,6 +41,29 @@ class LiteClockCapacityError extends Error {
     }
 }
 
+class LiteClockReentrancyError extends Error {
+    constructor() {
+        super(
+            "lite-clock: advance() re-entered during a tick (from an onComplete "
+            + "callback, effect, or subscriber). The tick is atomic; schedule "
+            + "follow-up advances for the next frame."
+        );
+        this.name = "LiteClockReentrancyError";
+    }
+}
+
+class LiteClockDisposedError extends Error {
+    constructor() {
+        super(
+            "lite-clock: clock method called after dispose(). dispose() is "
+            + "terminal -- counters freeze, every lane goes stale, and the frame "
+            + "signal node is returned to the pool. Create a new clock with "
+            + "createClock()."
+        );
+        this.name = "LiteClockDisposedError";
+    }
+}
+
 // ---------------------------------------------------------------------------
 // createClock
 // ---------------------------------------------------------------------------
@@ -71,6 +94,12 @@ function createClock(config) {
     let onCompleteFns = new Array(capacity);
     let completedIds = new Uint16Array(capacity);
     let freeList = new Uint16Array(capacity);
+    // Per-slot generation tag. Bumped on every disposal (one slot in
+    // disposeLane, every slot in clockDispose). A LaneHandle stamps the slot's
+    // generation at lane() and compares first on every method/read, so a
+    // handle to a freed-and-reused slot proves stale instead of driving the new
+    // tenant. Uint32: a wrap needs ~2 years of continuous single-slot churn.
+    let generations = new Uint32Array(capacity);
 
     // Initial state: activeIndex defaults to 0 from Int32Array; we use -1.
     for (let i = 0; i < capacity; i = (i + 1) | 0) {
@@ -92,6 +121,28 @@ function createClock(config) {
     // ---- Tick-source bookkeeping ------------------------------------------
     let detachFn = null;
     let lastRealTime = 0;
+    // Re-entrancy guard: set true across a tick, cleared in advance()'s finally.
+    // The tick (compaction -> frame propagation -> callback drain) is atomic; a
+    // nested advance()/advanceTo() from a callback, effect, or subscriber throws.
+    let advancing = false;
+    // dispose() is terminal. Once set, the mutation surface (advance, advanceTo,
+    // lane, attachRAF, attachInterval) throws LiteClockDisposedError; reads go
+    // inert but never undefined. Checked BEFORE the advancing guard so a dead
+    // clock throws DisposedError, never ReentrancyError.
+    let disposed = false;
+
+    // ---- SOA carrier for LaneHandle access --------------------------------
+    // The instance is frozen, so live arrays reach handles through this
+    // non-frozen carrier: handle reads stay plain data loads (no getter
+    // dispatch on the hot path) and growth reassigns the fields so a
+    // relocation is transparent to live handles. Only what handles read
+    // lives here.
+    const soa = {
+        positions: positions,
+        durations: durations,
+        flags: flags,
+        generations: generations
+    };
 
     // ---- Growth (rebinds SOA arrays) --------------------------------------
     function ensureCapacity() {
@@ -128,6 +179,10 @@ function createClock(config) {
 
         completedIds = new Uint16Array(newCap);
 
+        const ng = new Uint32Array(newCap);
+        ng.set(generations);            // copy old tags; tail zero-filled by ctor
+        generations = ng;
+
         const nfl = new Uint16Array(newCap);
         // Push the new slots [oldCap..newCap-1] in descending order so pop
         // yields ascending IDs.
@@ -137,6 +192,10 @@ function createClock(config) {
         }
         freeList = nfl;
         capacity = newCap;
+        soa.positions = positions;
+        soa.durations = durations;
+        soa.flags = flags;
+        soa.generations = generations;
     }
 
     // ---- Lane lifecycle (operates on integer IDs) -------------------------
@@ -208,18 +267,34 @@ function createClock(config) {
         positions[id] = 0;
         freeList[freeTop] = id & 0xFFFF;
         freeTop = (freeTop + 1) | 0;
+        generations[id] = (generations[id] + 1) >>> 0;   // retire this handle
     }
 
     // ---- advance(dt) -- the only mutation entry point --------------------
     function advance(dt) {
+        if (disposed) throw new LiteClockDisposedError();
         if (!Number.isFinite(dt) || dt < 0) {
             throw new RangeError(
                 "clock.advance: dt must be a finite non-negative number (got " + dt + ")"
             );
         }
+        // Re-entrancy guard lives in the cold entry/exit zones, not the per-lane
+        // loop. Both arms below run under one try/finally so a rethrowing effect
+        // (lite-signal set() rethrows synchronously; see decisions/0001) can
+        // neither brick the clock via a stuck guard nor drop queued completions.
+        if (advancing) throw new LiteClockReentrancyError();
+        advancing = true;
+
         if (dt === 0) {
             tickCount = (tickCount + 1) | 0;
-            frameSig.set(simTime);
+            try {
+                frameSig.set(simTime);
+            } finally {
+                // No completions queued on the dt=0 path (compaction is skipped),
+                // so the drain is empty; the guard still clears here because an
+                // effect can fire and re-enter during frameSig.set.
+                advancing = false;
+            }
             return;
         }
 
@@ -254,28 +329,40 @@ function createClock(config) {
         }
         activeCount = writeIdx;
 
-        // Propagate frame signal -- force-propagate, value = simTime.
-        frameSig.set(simTime);
+        // Capture the drain bounds BEFORE frameSig.set: an effect can grow the
+        // pool (swapping completedIds) or reset completedCount via nested state,
+        // and the drain must iterate the buffer that was filled (C-01/C-02).
+        const drainIds = completedIds;
+        const drainCount = completedCount;
 
-        // Drain end-of-tick completion callbacks. Callbacks fire AFTER signal
-        // propagation, so any effect that tracks lane.t() already observed the
-        // completion frame.
-        for (let i = 0; i < completedCount; i = (i + 1) | 0) {
-            const id = completedIds[i];
-            const fn = onCompleteFns[id];
-            if (fn !== undefined) {
-                try {
-                    fn();
-                } catch (e) {
-                    if (typeof console !== "undefined" && console.error) {
-                        console.error("[lite-clock] onComplete threw:", e);
+        try {
+            // Propagate frame signal -- force-propagate, value = simTime.
+            frameSig.set(simTime);
+        } finally {
+            // Drain end-of-tick completion callbacks. Callbacks fire AFTER signal
+            // propagation, so any effect that tracks lane.t() already observed the
+            // completion frame. In finally so a rethrowing effect cannot drop
+            // queued completions. Re-check FLAG_DONE: a slot disposed and
+            // reallocated during propagation/drain is no longer DONE (C-03).
+            for (let i = 0; i < drainCount; i = (i + 1) | 0) {
+                const id = drainIds[i];
+                const f = flags[id];
+                if ((f & FLAG_DONE) !== 0 && onCompleteFns[id] !== undefined) {
+                    try {
+                        onCompleteFns[id]();
+                    } catch (e) {
+                        if (typeof console !== "undefined" && console.error) {
+                            console.error("[lite-clock] onComplete threw:", e);
+                        }
                     }
                 }
             }
+            advancing = false;
         }
     }
 
     function advanceTo(t) {
+        if (disposed) throw new LiteClockDisposedError();
         if (!Number.isFinite(t)) {
             throw new RangeError("clock.advanceTo: t must be a finite number (got " + t + ")");
         }
@@ -294,6 +381,7 @@ function createClock(config) {
     }
 
     function attachRAF() {
+        if (disposed) throw new LiteClockDisposedError();
         if (detachFn !== null) detachFn();
         if (typeof requestAnimationFrame !== "function") {
             throw new Error("clock.attachRAF: requestAnimationFrame is not available in this runtime");
@@ -317,6 +405,7 @@ function createClock(config) {
     }
 
     function attachInterval(ms) {
+        if (disposed) throw new LiteClockDisposedError();
         if (detachFn !== null) detachFn();
         if (!Number.isFinite(ms) || ms <= 0) {
             throw new RangeError("clock.attachInterval: ms must be a finite positive number");
@@ -343,78 +432,117 @@ function createClock(config) {
 
     // ---- Frame signal accessor (read-only wrapper) -----------------------
     function frame() {
+        // Reads never return undefined (d.ts says number). After dispose the
+        // frame signal node is back in the lite-signal pool and stale accessors
+        // return undefined, so return the frozen simTime closure binding.
+        if (disposed) return simTime;
         return frameSig();
     }
 
     frame.peek = function () {
+        if (disposed) return simTime;
         return frameSig.peek();
     };
     frame.subscribe = function (fn) {
+        // A subscription on a dead clock could never fire again (advance throws),
+        // so a silent no-op subscriber would be a trap. Fail closed.
+        if (disposed) throw new LiteClockDisposedError();
         return frameSig.subscribe(fn);
     };
 
     // ---- Lane handle (prototype-based; reads route through instance) -----
-    function LaneHandle(c, id) {
+    // The generation stamped at lane() proves the handle still owns its slot.
+    // Every method and read compares generations[id] === this._gen FIRST; a
+    // mismatch is a stale handle (its slot was freed, maybe reused) and takes
+    // the inert tail branch WITHOUT touching the frame signal -- a dead read
+    // must not create a live dependency. Access goes through the clock's
+    // _soa carrier (plain data loads; growth reassigns its fields) so a
+    // relocation stays transparent to live handles and the hot read path
+    // pays no getter dispatch.
+    function LaneHandle(c, id, gen) {
         this._clock = c;
         this._id = id;
+        this._gen = gen;
     }
 
     LaneHandle.prototype.start = function () {
-        this._clock._startLane(this._id);
+        const c = this._clock;
+        if (c._soa.generations[this._id] !== this._gen) return;
+        c._startLane(this._id);
     };
     LaneHandle.prototype.pause = function () {
-        this._clock._pauseLane(this._id);
+        const c = this._clock;
+        if (c._soa.generations[this._id] !== this._gen) return;
+        c._pauseLane(this._id);
     };
     LaneHandle.prototype.reverse = function () {
-        this._clock._reverseLane(this._id);
+        const c = this._clock;
+        if (c._soa.generations[this._id] !== this._gen) return;
+        c._reverseLane(this._id);
     };
     LaneHandle.prototype.dispose = function () {
-        this._clock._disposeLane(this._id);
+        const c = this._clock;
+        if (c._soa.generations[this._id] !== this._gen) return;
+        c._disposeLane(this._id);
     };
 
     LaneHandle.prototype.position = function () {
-        this._clock._frameSig();
-        const id = this._id;
         const c = this._clock;
-        const p = c._positions[id];
-        return ((c._flags[id] & FLAG_REVERSE) !== 0) ? (c._durations[id] - p) : p;
+        const s = c._soa;
+        const id = this._id;
+        if (s.generations[id] !== this._gen) return 0;
+        c._frameSig();
+        const p = s.positions[id];
+        return ((s.flags[id] & FLAG_REVERSE) !== 0) ? (s.durations[id] - p) : p;
     };
 
     LaneHandle.prototype.t = function () {
-        this._clock._frameSig();
-        const id = this._id;
         const c = this._clock;
-        const dur = c._durations[id];
-        if (dur <= 0) return 0;
-        const ratio = c._positions[id] / dur;
-        return ((c._flags[id] & FLAG_REVERSE) !== 0) ? (1 - ratio) : ratio;
+        const s = c._soa;
+        const id = this._id;
+        if (s.generations[id] !== this._gen) return 0;
+        c._frameSig();
+        // durations[id] > 0 always for a readable handle: lane() rejects
+        // duration <= 0 and a stale handle returned above (C-12).
+        const dur = s.durations[id];
+        const ratio = s.positions[id] / dur;
+        return ((s.flags[id] & FLAG_REVERSE) !== 0) ? (1 - ratio) : ratio;
     };
 
     LaneHandle.prototype.done = function () {
-        this._clock._frameSig();
-        return (this._clock._flags[this._id] & FLAG_DONE) !== 0;
+        const c = this._clock;
+        const s = c._soa;
+        const id = this._id;
+        if (s.generations[id] !== this._gen) return false;
+        c._frameSig();
+        return (s.flags[id] & FLAG_DONE) !== 0;
     };
 
     LaneHandle.prototype.positionPeek = function () {
+        const s = this._clock._soa;
         const id = this._id;
-        const c = this._clock;
-        const p = c._positions[id];
-        return ((c._flags[id] & FLAG_REVERSE) !== 0) ? (c._durations[id] - p) : p;
+        if (s.generations[id] !== this._gen) return 0;
+        const p = s.positions[id];
+        return ((s.flags[id] & FLAG_REVERSE) !== 0) ? (s.durations[id] - p) : p;
     };
     LaneHandle.prototype.tPeek = function () {
+        const s = this._clock._soa;
         const id = this._id;
-        const c = this._clock;
-        const dur = c._durations[id];
-        if (dur <= 0) return 0;
-        const ratio = c._positions[id] / dur;
-        return ((c._flags[id] & FLAG_REVERSE) !== 0) ? (1 - ratio) : ratio;
+        if (s.generations[id] !== this._gen) return 0;
+        const dur = s.durations[id];
+        const ratio = s.positions[id] / dur;
+        return ((s.flags[id] & FLAG_REVERSE) !== 0) ? (1 - ratio) : ratio;
     };
     LaneHandle.prototype.donePeek = function () {
-        return (this._clock._flags[this._id] & FLAG_DONE) !== 0;
+        const s = this._clock._soa;
+        const id = this._id;
+        if (s.generations[id] !== this._gen) return false;
+        return (s.flags[id] & FLAG_DONE) !== 0;
     };
 
     // ---- Lane factory ----------------------------------------------------
     function lane(opts) {
+        if (disposed) throw new LiteClockDisposedError();
         if (opts === null || typeof opts !== "object") {
             throw new TypeError("clock.lane: opts must be an object");
         }
@@ -427,23 +555,29 @@ function createClock(config) {
             throw new TypeError("clock.lane: opts.onComplete must be a function");
         }
         const id = allocLane(dur, oc);
-        return new LaneHandle(instance, id);
+        return new LaneHandle(instance, id, generations[id]);
     }
 
     function clockDispose() {
+        if (disposed) return;                      // terminal + idempotent
+        disposed = true;
         if (detachFn !== null) detachFn();
         // Return the frame signal's node to the lite-signal pool. Without this,
         // every createClock()/dispose() cycle permanently leaks one registry
         // slot; consumers that mount/unmount clocks per game level or component
         // would eventually hit lite-signal's CapacityError at ~1024 cycles.
         disposeSig(frameSig);
-        // Reset state. Existing LaneHandle objects become inert (their slots
-        // are freed; subsequent method calls become no-ops via FLAG_ALLOC check).
+        // Reset state. Zero-filling flags is what makes a dispose-mid-tick skip
+        // the remaining drain (the finally re-checks FLAG_DONE). Every slot's
+        // generation is bumped so every outstanding LaneHandle proves stale.
+        // Counters (simTime/tickCount) are NOT reset: dispose is terminal, they
+        // freeze (see decisions/0002, C-08).
         for (let i = 0; i < capacity; i = (i + 1) | 0) {
             flags[i] = 0;
             activeIndex[i] = NO_INDEX;
             onCompleteFns[i] = undefined;
             positions[i] = 0;
+            generations[i] = (generations[i] + 1) >>> 0;
         }
         activeCount = 0;
         completedCount = 0;
@@ -454,8 +588,9 @@ function createClock(config) {
     }
 
     // ---- Public instance --------------------------------------------------
-    // Getters for SOA arrays so LaneHandle prototype reads see growth-relocated
-    // arrays. Read cost: one property access per call -- accepted.
+    // LaneHandle access goes through the _soa carrier (plain data loads);
+    // growth reassigns the carrier fields, so handles always see the live
+    // arrays without per-read getter dispatch.
     const instance = {
         advance: advance,
         advanceTo: advanceTo,
@@ -479,20 +614,37 @@ function createClock(config) {
         },
         // Private hooks for LaneHandle prototype
         _frameSig: frameSig,
-        get _positions() {
-            return positions;
-        },
-        get _durations() {
-            return durations;
-        },
-        get _flags() {
-            return flags;
-        },
+        _soa: soa,
         _startLane: startLane,
         _pauseLane: pauseLane,
         _reverseLane: reverseLane,
         _disposeLane: disposeLane
     };
+
+    // ---- Test-only conservation hook (UNSTABLE; not in d.ts or llms.txt) --
+    // Non-enumerable so it never widens the public/frozen surface. O(capacity),
+    // never called from any hot path -- the torture suite runs it between
+    // phases. Reads the CURRENT closure bindings so it sees growth-rebound
+    // arrays. Returns null when every invariant holds, else a short string
+    // naming the first violated line (see ROADMAP.md section 2).
+    Object.defineProperty(instance, "_invariant", {
+        value: function () {
+            let allocCount = 0;
+            for (let i = 0; i < capacity; i = (i + 1) | 0) {
+                if ((flags[i] & FLAG_ALLOC) !== 0) allocCount = (allocCount + 1) | 0;
+            }
+            if (allocCount + freeTop !== capacity) return "slot-conservation";
+            for (let i = 0; i < activeCount; i = (i + 1) | 0) {
+                if (activeIndex[activeList[i]] !== i) return "active-index-roundtrip";
+            }
+            for (let id = 0; id < capacity; id = (id + 1) | 0) {
+                const active = (flags[id] & FLAG_ACTIVE) !== 0;
+                if (active !== (activeIndex[id] !== NO_INDEX)) return "active-flag-index-agreement";
+            }
+            return null;
+        },
+        enumerable: false
+    });
 
     return Object.freeze(instance);
 }
@@ -501,4 +653,6 @@ function createClock(config) {
 // Exports
 // ---------------------------------------------------------------------------
 
-export {createClock, LiteClockCapacityError};
+const VERSION = "1.1.0";
+
+export {createClock, LiteClockCapacityError, LiteClockReentrancyError, LiteClockDisposedError, VERSION};

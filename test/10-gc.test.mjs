@@ -1,4 +1,10 @@
 // 10-gc.test.mjs
+// FAST SMOKE ONLY. The authoritative memory gate is test/torture.mjs tiers
+// t6 (zero-alloc gc gate) and t7 (lite-leak soak + conservation), run as
+// `node --expose-gc test/torture.mjs`. These heapUsed-delta budgets are
+// coarse (256 KB tolerates ~26 B/op steady leak) and exist only as a quick
+// local smoke; do not treat them as the zero-GC proof.
+//
 // Zero-allocation hot path verification. Requires --expose-gc.
 //
 //     node --expose-gc --test --test-reporter=spec test/10-gc.test.mjs

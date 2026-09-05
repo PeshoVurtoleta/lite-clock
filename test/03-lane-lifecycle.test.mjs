@@ -116,6 +116,40 @@ test("lane: methods on a disposed lane are silent no-ops", () => {
     // No throws.
 });
 
+test("lane: C-04 -- a stale handle cannot drive or read a reused slot", () => {
+    // Fail-before (pre-K2 1.0.2): stale a.tPeek() read the reused tenant (0.5)
+    // and stale a.dispose() killed it (activeCount 1->0).
+    const c = createClock();
+    const a = c.lane({ duration: 100 });
+    a.dispose();
+    const b = c.lane({ duration: 100 });   // reuses A's slot (LIFO)
+    b.start();
+    c.advance(50);                          // B at t=0.5
+    assert.equal(c.activeCount, 1);
+    assert.equal(a.tPeek(), 0);            // stale read inert (was 0.5)
+    assert.equal(a.positionPeek(), 0);
+    assert.equal(a.donePeek(), false);
+    a.dispose();                           // stale dispose is a no-op (was fatal to B)
+    assert.equal(c.activeCount, 1);        // tenant B untouched (was 0)
+    assert.equal(b.tPeek(), 0.5);
+});
+
+test("lane: disposed-handle methods are no-ops even after the slot is reused", () => {
+    // Reuse sibling of "methods on a disposed lane are silent no-ops": the slot
+    // is reallocated to B, and the stale A handle must not touch B.
+    const c = createClock({ capacity: 2 });
+    const a = c.lane({ duration: 100 });
+    a.start();
+    a.dispose();
+    const b = c.lane({ duration: 100 });   // reuses A's slot
+    b.start();
+    c.advance(20);
+    a.start(); a.pause(); a.reverse();     // all no-ops on B
+    assert.equal(c.activeCount, 1);
+    assert.equal(b.positionPeek(), 20);
+    assert.equal(b.tPeek(), 0.2);
+});
+
 test("lane: start() on an already-running lane is idempotent", () => {
     const c = createClock();
     const l = c.lane({ duration: 100 });

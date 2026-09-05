@@ -5,7 +5,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { effect } from "@zakkster/lite-signal";
-import { createClock } from "../Clock.js";
+import { createClock, LiteClockReentrancyError } from "../Clock.js";
 
 test("onComplete: fires exactly once when lane reaches duration", () => {
     const c = createClock();
@@ -128,4 +128,78 @@ test("onComplete: multiple lanes completing the same tick fire in their active-l
     // All complete this tick; order matches activeList traversal order (which
     // is insertion order for lanes started before any completion).
     assert.deepEqual(fires, ["a", "b", "x"]);
+});
+
+// ---------------------------------------------------------------------------
+// K1 drain-integrity regressions (C-01/C-02/C-03). Each PROVEN against the
+// pre-K1 (1.0.1) build to fail before the fix and pass after:
+//   C-01 before: fired=["A"] (B dropped forever, no throw).
+//   C-02 before: fired=["A","A"] (A twice, B never -- growth swapped the queue).
+//   C-03 before: fired=["A","C"] with C fired at t=0 on its CREATION tick.
+// After K1: nested advance throws LiteClockReentrancyError; growth-from-callback
+// fires the correct siblings; a reused slot never misfires the new tenant.
+// ---------------------------------------------------------------------------
+
+test("onComplete: re-entrant advance() throws inside the callback; the sibling still fires (C-01)", () => {
+    const c = createClock();
+    const fired = [];
+    let caught = null;
+    const a = c.lane({
+        duration: 50,
+        onComplete: () => { fired.push("A"); try { c.advance(1); } catch (e) { caught = e; } }
+    });
+    const b = c.lane({ duration: 50, onComplete: () => { fired.push("B"); } });
+    a.start(); b.start();
+    c.advance(60);
+    assert.ok(caught instanceof LiteClockReentrancyError, "nested advance threw LiteClockReentrancyError");
+    assert.deepEqual(fired, ["A", "B"]);   // B not dropped -- the drain continued
+});
+
+test("onComplete: growth triggered from a callback fires the correct sibling callbacks (C-02)", () => {
+    const c = createClock({ capacity: 2, growable: true });
+    const fired = [];
+    const a = c.lane({
+        duration: 50,
+        onComplete: () => { fired.push("A"); const x = c.lane({ duration: 100 }); x.start(); }
+    });
+    const b = c.lane({ duration: 50, onComplete: () => { fired.push("B"); } });
+    a.start(); b.start();
+    c.advance(60);
+    assert.deepEqual(fired, ["A", "B"]);   // captured drain buffer, not the swapped one
+});
+
+test("onComplete: disposing a queued sibling and reusing its slot never misfires the new tenant (C-03)", () => {
+    const c = createClock();
+    const fired = [];
+    let bHandle;
+    let cHandle = null;
+    const a = c.lane({
+        duration: 50,
+        onComplete: () => {
+            fired.push("A");
+            bHandle.dispose();                                   // dispose queued sibling
+            cHandle = c.lane({ duration: 100, onComplete: () => fired.push("C") });
+            cHandle.start();                                     // reuses B's LIFO slot
+        }
+    });
+    bHandle = c.lane({ duration: 50, onComplete: () => fired.push("B") });
+    a.start(); bHandle.start();
+    c.advance(60);
+    assert.deepEqual(fired, ["A"]);        // C did NOT misfire at t=0; B skipped (disposed)
+    assert.equal(cHandle.donePeek(), false);
+    c.advance(200);
+    assert.deepEqual(fired, ["A", "C"]);   // C fires exactly once, on its real completion
+});
+
+test("frame.subscribe: re-entrant advance() on the second fire throws; queued completions still fire", () => {
+    // lite-signal fires subscribe callbacks immediately at subscribe time, so
+    // the completion tick is the SECOND fire -- re-entry must trigger there.
+    const c = createClock();
+    const fired = [];
+    c.lane({ duration: 50, onComplete: () => fired.push("A") }).start();
+    let calls = 0;
+    const unsub = c.frame.subscribe(() => { calls = (calls + 1) | 0; if (calls === 2) c.advance(1); });
+    assert.throws(() => c.advance(60), LiteClockReentrancyError);
+    unsub();
+    assert.deepEqual(fired, ["A"]);        // finally-drain fired the queued completion despite rethrow
 });

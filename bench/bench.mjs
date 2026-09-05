@@ -122,10 +122,14 @@ console.log("\n@zakkster/lite-clock 1.0.0 -- bench (node --expose-gc)\n");
 // 5. completion-fanout: 100 lanes all completing the same tick + onComplete
 // ---------------------------------------------------------------------------
 {
-    const c = createClock({ capacity: 128 });
     let completed = 0;
     const onDone = () => { completed = (completed + 1) | 0; };
     measure("completion-fanout-100", 100, 5_000, () => {
+        // Rebuild the clock INSIDE the iteration: a dead clock now throws
+        // LiteClockDisposedError, so a shared clock disposed each iter can no
+        // longer be reused (it relied on the C-06 zombie bug). The scenario
+        // always intended a fresh small clock per iter.
+        const c = createClock({ capacity: 128 });
         for (let i = 0; i < 100; i++) {
             const l = c.lane({ duration: 50, onComplete: onDone });
             l.start();

@@ -48,7 +48,15 @@ export async function run() {
             + "  stderr: " + tail(naiveCarry.stderr, 400);
     });
 
+    const snapOmit = spawnControl("snap-omit-freeTop");
+    assert(snapOmit.status !== 0, function () {
+        return "t9 control 'snap-omit-freeTop' exited 0 (gate is decorative)\n"
+            + "  stdout: " + tail(snapOmit.stdout, 400) + "\n"
+            + "  stderr: " + tail(snapOmit.stderr, 400);
+    });
+
     console.log("t9 controls: pass (alloc exit=" + alloc.status
         + " leak exit=" + leak.status + " stale exit=" + stale.status
-        + " config exit=" + config.status + " naive-carry exit=" + naiveCarry.status + ")");
+        + " config exit=" + config.status + " naive-carry exit=" + naiveCarry.status
+        + " snap-omit-freeTop exit=" + snapOmit.status + ")");
 }

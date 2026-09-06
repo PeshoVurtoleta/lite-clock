@@ -1,6 +1,6 @@
 // 17-stats.test.mjs
 // stats(out?) -- a read surface. Fills a caller sink (zero-alloc) or allocates
-// the documented convenience. Seven fields in a fixed order. peakActive is a
+// the documented convenience. Eight fields in a fixed order. peakActive is a
 // high-water mark; totalCompletions counts cycles including callback-less lanes.
 // Stays readable (frozen counters) after dispose.
 
@@ -8,9 +8,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createClock } from "../Clock.js";
 
-const FIELDS = ["capacity", "peakActive", "poolFree", "poolUsed", "timeScale", "totalCompletions", "totalTicks"];
+const FIELDS = ["capacity", "droppedMs", "peakActive", "poolFree", "poolUsed", "timeScale", "totalCompletions", "totalTicks"];
 
-test("stats: fresh object has exactly the 7 fields with correct values", () => {
+test("stats: fresh object has exactly the 8 fields with correct values", () => {
     const c = createClock({ capacity: 8 });
     const a = c.lane({ duration: 10 });
     const b = c.lane({ duration: 20 });
@@ -25,6 +25,7 @@ test("stats: fresh object has exactly the 7 fields with correct values", () => {
     assert.equal(s.totalCompletions, 1);
     assert.equal(s.capacity, 8);
     assert.equal(s.timeScale, 1);
+    assert.equal(s.droppedMs, 0);
 });
 
 test("stats(out): fills and returns the SAME reference, overwriting stale fields", () => {

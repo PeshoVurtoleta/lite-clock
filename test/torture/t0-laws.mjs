@@ -286,6 +286,111 @@ export async function run() {
         assertEq(l.donePeek(), true, "boundary done");
         assertEq(fires, 1, "boundary fire count");
     }
+
+    // ---- snapshot/hydrate round-trip law (K5, D1/D2/D3) --------------------
+    // same-clock snapshot -> hydrate -> advance(seq) is bit-identical to an
+    // uninterrupted advance(seq): compared by byte-equal final snapshots AND
+    // per-lane onComplete fire counts. Mixed one-shot/loop/pingPong lanes, a
+    // non-dyadic (0.3) cycling duration, and a re-advance sequence that crosses
+    // multiple cycles. The window contains no lane()/dispose() (D1a), so refire
+    // fidelity is exact. Cross-clock virgin-hydrate variant proves A2.
+    {
+        // Reference: uninterrupted advance of the whole sequence.
+        const fcU = new Int32Array(RT_N);
+        const cU = createClock();
+        const lU = armRoundTrip(cU, fcU);
+        for (let i = 0; i < RT_WARM.length; i = (i + 1) | 0) cU.advance(RT_WARM[i]);
+        for (let i = 0; i < RT_SEQ.length; i = (i + 1) | 0) cU.advance(RT_SEQ[i]);
+        const bufU = new Uint8Array(cU.snapshotSize());
+        cU.snapshot(bufU);
+
+        // Same-clock round-trip: warm, snapshot at P, hydrate back onto self,
+        // then advance the tail sequence.
+        const fcR = new Int32Array(RT_N);
+        const cR = createClock();
+        const lR = armRoundTrip(cR, fcR);
+        for (let i = 0; i < RT_WARM.length; i = (i + 1) | 0) cR.advance(RT_WARM[i]);
+        const bufP = new Uint8Array(cR.snapshotSize());
+        cR.snapshot(bufP);
+        cR.hydrate(bufP);
+        for (let i = 0; i < RT_SEQ.length; i = (i + 1) | 0) cR.advance(RT_SEQ[i]);
+        const bufR = new Uint8Array(cR.snapshotSize());
+        cR.snapshot(bufR);
+
+        assertBytesEqual(bufU, bufR, "round-trip same-clock final snapshot");
+        for (let i = 0; i < RT_N; i = (i + 1) | 0) {
+            assertEq(fcR[i], fcU[i], function () { return "round-trip same-clock fire count lane " + i; });
+        }
+        assertEq(lR.length, lU.length, "round-trip lane count");
+
+        // Cross-clock variant: hydrate P onto a virgin same-capacity clock, drive
+        // the identical tail, compare byte-equal to the uninterrupted reference.
+        const cX = createClock();
+        cX.hydrate(bufP);
+        for (let i = 0; i < RT_SEQ.length; i = (i + 1) | 0) cX.advance(RT_SEQ[i]);
+        const bufX = new Uint8Array(cX.snapshotSize());
+        cX.snapshot(bufX);
+        assertBytesEqual(bufU, bufX, "round-trip cross-clock final snapshot");
+    }
+
+    // ---- k-fold-adjacent capture (K5) -------------------------------------
+    // Capture ONE step short of a Uint32 cycle-count fold (2^30) on a dur-1 loop
+    // lane, hydrate onto a virgin clock, then advance across the fold on both.
+    // Byte-equal final snapshots prove the fold is restored path-independently.
+    {
+        const cU = createClock();
+        const lU = cU.lane({ duration: 1, loop: true });
+        lU.start();
+        cU.advance((2 ** 30) - 1 + 0.5);           // one cycle short of the fold
+        const bufP = new Uint8Array(cU.snapshotSize());
+        cU.snapshot(bufP);
+
+        const cH = createClock();
+        cH.hydrate(bufP);
+        cU.advance(4.25);                           // crosses the fold
+        cH.advance(4.25);
+
+        const bufU = new Uint8Array(cU.snapshotSize());
+        const bufH = new Uint8Array(cH.snapshotSize());
+        cU.snapshot(bufU);
+        cH.snapshot(bufH);
+        assertBytesEqual(bufU, bufH, "k-fold-adjacent capture final snapshot");
+        assertEq(cU.simTime, cH.simTime, "k-fold-adjacent simTime");
+        assertEq(lU.positionPeek(), 0.75, "k-fold-adjacent position post-fold");
+    }
+}
+
+// ---- round-trip law fixtures (K5) -----------------------------------------
+// Mixed lanes with counting callbacks; a non-dyadic 0.3 cycling duration keeps
+// the carry ulp-sensitive. RT_WARM reaches a mid-state P; RT_SEQ is the tail
+// re-advanced identically on every world. Integer + .5 dts keep simTime exact.
+const RT_N = 6;
+const RT_DURS = [40, 7, 10, 0.3, 8, 1e9];
+const RT_MODES = [0, 0, "loop", "loop", "pingPong", 0];
+const RT_WARM = [12.5, 9, 3.5];
+const RT_SEQ = [5, 17.5, 2, 30, 0.5, 100];
+
+function armRoundTrip(c, fireCounts) {
+    const lanes = new Array(RT_N);
+    for (let i = 0; i < RT_N; i = (i + 1) | 0) {
+        const idx = i;
+        const opts = { duration: RT_DURS[idx], onComplete: function () { fireCounts[idx] = (fireCounts[idx] + 1) | 0; } };
+        if (RT_MODES[idx] === "loop") opts.loop = true;
+        else if (RT_MODES[idx] === "pingPong") opts.pingPong = true;
+        const l = c.lane(opts);
+        l.start();
+        lanes[i] = l;
+    }
+    return lanes;
+}
+
+function assertBytesEqual(a, b, label) {
+    assertEq(a.length, b.length, function () { return label + " length"; });
+    for (let i = 0; i < a.length; i = (i + 1) | 0) {
+        if (a[i] !== b[i]) {
+            assertEq(a[i], b[i], function () { return label + " byte " + i; });
+        }
+    }
 }
 
 // A fixed scripted op sequence. Callbacks log a label into `log`; reads and

@@ -136,6 +136,43 @@ export async function run() {
         }
         assertThrows(function () { c.lane({ duration: 1e9 }); }, LiteClockCapacityError, "capacity", "full-pool exhaustion");
     }
+
+    // ---- attachFixed stepMs + opts guard ladder (K5, D5/A6) ---------------
+    // Every row throws BEFORE the rAF check, so no runtime shim is needed here.
+    {
+        const c = createClock();
+        // stepMs must be a finite number > 0.
+        assertThrows(function () { c.attachFixed(NaN); }, RangeError, "stepMs must be a finite number > 0", "attachFixed stepMs NaN");
+        assertThrows(function () { c.attachFixed(0); }, RangeError, "stepMs must be a finite number > 0", "attachFixed stepMs 0");
+        assertThrows(function () { c.attachFixed(-16); }, RangeError, "stepMs must be a finite number > 0", "attachFixed stepMs negative");
+        assertThrows(function () { c.attachFixed(Infinity); }, RangeError, "stepMs must be a finite number > 0", "attachFixed stepMs Infinity");
+        assertThrows(function () { c.attachFixed("16"); }, RangeError, "stepMs must be a finite number > 0", "attachFixed stepMs non-number");
+
+        // opts shape + config law.
+        assertThrows(function () { c.attachFixed(16, 5); }, TypeError, "opts must be an object", "attachFixed opts non-object");
+        assertThrows(function () { c.attachFixed(16, { maxSubStep: 4 }); }, TypeError, "did you mean 'maxSubSteps'?", "attachFixed typo maxSubStep");
+        assertThrows(function () { c.attachFixed(16, { frobnicate: 1 }); }, TypeError, "known keys: maxSubSteps", "attachFixed junk key");
+
+        // maxSubSteps type (TypeError) then value (RangeError) -- growable precedent.
+        assertThrows(function () { c.attachFixed(16, { maxSubSteps: "8" }); }, TypeError, "maxSubSteps must be a number", "attachFixed maxSubSteps non-number");
+        assertThrows(function () { c.attachFixed(16, { maxSubSteps: null }); }, TypeError, "maxSubSteps must be a number", "attachFixed maxSubSteps null");
+        assertThrows(function () { c.attachFixed(16, { maxSubSteps: 0 }); }, RangeError, "maxSubSteps must be an integer >= 1", "attachFixed maxSubSteps 0");
+        assertThrows(function () { c.attachFixed(16, { maxSubSteps: -3 }); }, RangeError, "maxSubSteps must be an integer >= 1", "attachFixed maxSubSteps negative");
+        assertThrows(function () { c.attachFixed(16, { maxSubSteps: 2.5 }); }, RangeError, "maxSubSteps must be an integer >= 1", "attachFixed maxSubSteps non-integer");
+    }
+
+    // ---- hydrate bad-value rows: non-Uint8Array shapes (K5, D3/A4) --------
+    {
+        const c = createClock();
+        assertThrows(function () { c.hydrate(null); }, TypeError, "buf must be a Uint8Array", "hydrate null");
+        assertThrows(function () { c.hydrate(undefined); }, TypeError, "buf must be a Uint8Array", "hydrate undefined");
+        assertThrows(function () { c.hydrate(5); }, TypeError, "buf must be a Uint8Array", "hydrate number");
+        assertThrows(function () { c.hydrate("x"); }, TypeError, "buf must be a Uint8Array", "hydrate string");
+        assertThrows(function () { c.hydrate({}); }, TypeError, "buf must be a Uint8Array", "hydrate plain object");
+        assertThrows(function () { c.hydrate([]); }, TypeError, "buf must be a Uint8Array", "hydrate array");
+        assertThrows(function () { c.hydrate(new ArrayBuffer(128)); }, TypeError, "buf must be a Uint8Array", "hydrate ArrayBuffer");
+        assertThrows(function () { c.hydrate(new Float64Array(128)); }, TypeError, "buf must be a Uint8Array", "hydrate Float64Array");
+    }
 }
 
 // ---- control: the t1 config-law gate must be able to FAIL -------------------
@@ -203,5 +240,70 @@ export async function runControlNaiveCarry() {
         process.exit(1);
     }
     console.error("[control naive-carry] gate did NOT trip -- naive carry bit-exact (impossible)");
+    process.exit(0);
+}
+
+// ---- control: the snapshot round-trip law must be able to FAIL ---------------
+// A restore that OMITS freeTop (state otherwise faithful) leaves the pool cursor
+// at the virgin value while the freeList slab holds the captured permutation:
+// the next alloc pops a slot that is already tenanted, slot conservation breaks,
+// and the post-churn snapshot diverges from the faithful reference. The omission
+// is emulated through the public surface by patching the snapshot's freeTop
+// scalar (header 16 B + scalar index 6 * 8 = byte offset 64) to the virgin pool
+// value before hydrate -- byte-identical to what a freeTop-forgetting restore
+// produces. Fail-before evidence: scratchpad/failbefore-k5.txt (a): faithful
+// tails byte-equal, omit tails diverge at byte 70, invariant slot-conservation.
+export async function runControlSnapOmitFreeTop() {
+    function build() {
+        const c = createClock({ capacity: 16 });
+        const hs = [];
+        for (let i = 0; i < 10; i = (i + 1) | 0) {
+            const h = c.lane({ duration: 100 });
+            h.start();
+            hs.push(h);
+        }
+        hs[2].dispose(); hs[5].dispose(); hs[7].dispose();   // non-monotone free list
+        c.advance(3);
+        return c;
+    }
+    // Deterministic post-hydrate tail: alloc into the restored pool, advance,
+    // capture. Divergence anywhere lands in the returned bytes.
+    function churnTail(c) {
+        const a = c.lane({ duration: 5 }); a.start();
+        const b = c.lane({ duration: 9 }); b.start();
+        c.advance(2);
+        const out = new Uint8Array(c.snapshotSize());
+        c.snapshot(out);
+        return out;
+    }
+    const src = build();
+    const snap = new Uint8Array(src.snapshotSize());
+    src.snapshot(snap);
+
+    const ref = createClock({ capacity: 16 });
+    ref.hydrate(snap);
+    const refTail = churnTail(ref);
+
+    const bad = new Uint8Array(snap);                        // fresh aligned buffer
+    new Float64Array(bad.buffer, 64, 1)[0] = 16;             // freeTop := virgin capacity
+    const omit = createClock({ capacity: 16 });
+    omit.hydrate(bad);
+    const omitTail = churnTail(omit);
+
+    try {
+        let same = refTail.length === omitTail.length;
+        if (same) {
+            for (let i = 0; i < refTail.length; i = (i + 1) | 0) {
+                if (refTail[i] !== omitTail[i]) { same = false; break; }
+            }
+        }
+        assert(same, function () {
+            return "snap-omit-freeTop: post-churn snapshots must be byte-equal (round-trip law)";
+        });
+    } catch (e) {
+        console.error("[control snap-omit-freeTop] gate tripped as expected: " + (e && e.message));
+        process.exit(1);
+    }
+    console.error("[control snap-omit-freeTop] gate did NOT trip -- omitted freeTop preserved the law (impossible)");
     process.exit(0);
 }

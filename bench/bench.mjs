@@ -2,7 +2,7 @@
 //
 // Run with:    node --expose-gc bench/bench.mjs
 //
-// Seven scenarios spanning the hot paths a real consumer hits:
+// Eight scenarios spanning the hot paths a real consumer hits:
 //   1. idle-advance         no active lanes; pure framing overhead per tick
 //   2. active-lanes-1k      1000 active lanes; SOA compaction at scale
 //   3. lane-reads           position/t/done reads inside an effect (reactive path)
@@ -11,6 +11,8 @@
 //   6. attach-interval-once  one-time cost (sanity for the attach helpers)
 //   7. loop-cycle-100       100 loop lanes each completing a cycle per tick
 //                            (isolates the 1.3.0 completion-arm carry branch)
+//   8. snapshot-1024        per-frame state capture into a caller buffer
+//                            (isolates the 1.4.0 rollback-consumer hot call)
 //
 // Methodology:
 //   - Warm-up phase runs the hot path long enough for V8 to optimize.
@@ -182,6 +184,27 @@ console.log("\n@zakkster/lite-clock 1.0.0 -- bench (node --expose-gc)\n");
     c.dispose();
     // Reference the counter so V8 cannot dead-store the callbacks.
     if (cycles === -1) console.log("");
+}
+
+// ---------------------------------------------------------------------------
+// 8. snapshot-1024: the 1.4.0 rollback-consumer hot call, isolated.
+// Default-capacity clock with mixed live lanes (150 one-shot + 50 loop, so
+// both lazy slab pairs are materialized and all ten slabs are honestly
+// copied). The buffer is preallocated OUTSIDE the measured fn -- the per-frame
+// consumer pattern snapshot() is designed for. Zero allocation per call.
+// ---------------------------------------------------------------------------
+{
+    const c = createClock({ capacity: 1024 });
+    for (let i = 0; i < 200; i++) {
+        const l = c.lane(i < 50
+            ? { duration: 1, loop: true }
+            : { duration: 1e9 });
+        l.start();
+    }
+    c.advance(0.5);
+    const buf = new Uint8Array(c.snapshotSize());
+    measure("snapshot-1024", 1, 50_000, () => { c.snapshot(buf); });
+    c.dispose();
 }
 
 console.log("");

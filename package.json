@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-clock",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray lane pool, deterministic advance(dt), single frame signal carrying simTime. Hits 10K concurrent lanes with zero per-frame allocation.",
   "author": "Zahary Shinikchiev <shinikchiev@yahoo.com>",
   "license": "MIT",

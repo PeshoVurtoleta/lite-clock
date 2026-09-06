@@ -32,6 +32,9 @@ if (control !== undefined && control !== "") {
     } else if (control === "naive-carry") {
         const m = await import("./torture/t1-degenerate.mjs");
         await m.runControlNaiveCarry();
+    } else if (control === "snap-omit-freeTop") {
+        const m = await import("./torture/t1-degenerate.mjs");
+        await m.runControlSnapOmitFreeTop();
     } else {
         console.error("torture: unknown TORTURE_CONTROL '" + control + "'");
         process.exit(1);

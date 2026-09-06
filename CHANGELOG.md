@@ -7,6 +7,151 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 1.4.0 -- 2026-09-06
+
+The determinism keystone: binary state capture/restore (`snapshotSize` /
+`snapshot` / `hydrate`) and a fixed-timestep driver (`attachFixed`) with an
+exact drop counter. Add-only -- the entire existing tick surface (`advanceBy`,
+`advance`, `advanceTo`, the compaction loop, the drain, the dt=0 path, handle
+reads, frame accessors) is diff-identical to 1.3.0; the whole-file diff
+against 1.3.0 contains zero deleted or modified lines beyond the two version
+strings (the header comment and the VERSION const). Valid 1.3.0 programs
+behave identically.
+
+### Added
+
+- **`clock.snapshotSize()`**: exact snapshot byte length for the current
+  capacity, `72 + 49 * capacity`. Pure read; legal on a disposed clock.
+- **`clock.snapshot(out: Uint8Array)`**: captures ALL replay-observable sim
+  state -- 7 scalars (simTime, timeScale, tickCount, totalCompletions,
+  peakActive, activeCount, freeTop) and 10 SOA slabs (startTimes,
+  baseStartTimes, durations, positions, flags, generations, activeList,
+  activeIndex, freeList, cycleCounts) -- behind a versioned 72-byte header
+  (magic `0x4C43534E`, format 1, capacity, endianness canary). Returns bytes
+  written. Zero allocation: slab bytes are memcpy'd through cached internal
+  byte views built only at cold sites (construction, growth, lazy-array
+  materialization); no view is ever created over `out`, so `out` may sit at
+  any byte offset (a lite-rollback ring slot works as-is). NOT captured, by
+  decision (decisions/0004-snapshot.md): onComplete functions (live table
+  kept by id), attach/driver state (droppedMs included), the completion
+  queue (provably empty outside a tick). Native-endian, canary-guarded: a
+  snapshot is NOT a wire format. Throws mid-tick (LiteClockReentrancyError
+  -- the atomic-tick law extends to capture), on a non-Uint8Array
+  (TypeError), on a short buffer (RangeError; longer is legal). Readable on
+  a disposed clock.
+- **`clock.hydrate(buf: Uint8Array)`**: restores a snapshot onto this clock
+  through a nine-guard fail-closed ladder with no mutation until every guard
+  passes: disposed -> LiteClockDisposedError; mid-tick ->
+  LiteClockReentrancyError; non-Uint8Array -> TypeError; short header ->
+  RangeError; bad magic / unsupported format / endian-canary mismatch ->
+  TypeError; capacity mismatch -> RangeError (same capacity required); short
+  buffer -> RangeError. Materializes the four 1.3.0-lazy arrays
+  (baseStartTimes, cycleCounts, completedCycles, completedGens) if null
+  before restore and rebuilds the cached views. Bumps NO generations:
+  handles minted before a same-clock capture stay valid after restore. The
+  live onComplete table is preserved by id, so restore + re-advance REFIRES
+  completions from the rolled-back timeline -- onComplete side effects must
+  be rollback-aware or idempotent (the consumer's contract, documented in
+  README and llms.txt). Documented boundaries: refire fidelity is exact only
+  across rollback windows containing no `lane()`/`dispose()`; a handle
+  minted after the capture addresses whatever the restore puts in its slot.
+  The restore path allocates ~10 short-lived subarray views; capture
+  allocates nothing.
+- **The round-trip law** (torture-gated): `snapshot -> hydrate ->
+  advance(seq)` is bit-identical to uninterrupted `advance(seq)` --
+  positions, flags, generations, free-list order, carry state, counters --
+  at fuzzed capture points, loop/pingPong lanes included.
+- **`clock.attachFixed(stepMs, opts?)`**: fixed-timestep rAF accumulator.
+  Real frame time accrues; the sim advances only in exact `stepMs` quanta
+  through the public `advance()` (sim quantum = `stepMs * timeScale`); the
+  sub-quantum remainder always carries. `opts.maxSubSteps` (default 8) caps
+  catch-up: excess whole quanta are dropped, never fed, and counted exactly
+  in `droppedMs` (`d = acc - (acc % stepMs)`). The substep loop breaks if a
+  callback disposes the clock mid-frame. Validation fails closed: disposed
+  -> LiteClockDisposedError; non-finite/non-positive stepMs -> RangeError;
+  opts under the config law (unknown key -> TypeError with did-you-mean;
+  maxSubSteps must be an integer >= 1). Each attach replaces any prior
+  attach; detach() cancels.
+- **`stats().droppedMs`** (field 8, appended): real ms dropped by
+  attachFixed's cap. Driver state: never captured by a snapshot, never
+  reset. A frame whose callback disposes the clock still lands that frame's
+  own drop accounting (genuinely dropped real time); the value is stable
+  from the next frame on.
+- **Bench cell 8, `snapshot-1024`**: one full capture of a 1024-capacity
+  clock (50,248 B) into a preallocated buffer per op. AFTER-only -- the
+  feature does not exist on 1.3.0 bytes.
+
+### Changed
+
+- `test/17-stats.test.mjs` shape pins updated for the appended 8th field --
+  the ONLY sanctioned existing-test edits this cycle: line 3 (header
+  comment, seven -> eight), line 11 (FIELDS array + `droppedMs`), line 13
+  (test title), plus one added `assert.equal(s.droppedMs, 0)`. Every other
+  existing test, pin, and torture budget is unmodified.
+- `_invariant` (test-only hook, not public surface) gains a fourth line,
+  `free-list-coherence`: every free-list entry in `[0, freeTop)` must be
+  in-bounds, unallocated, and unique -- the corruption class an unfaithful
+  restore would introduce, invisible to the first three lines.
+- README benchmark table refreshed to current-machine numbers (the previous
+  table predated 1.3.0 and lacked the loop-cycle row); test-suite listing
+  brought current (12-19).
+
+### Testing
+
+- `test/18-snapshot.test.mjs` + `test/19-attach-fixed.test.mjs`: 37 new
+  boundary tests (guard ladders by class + message fragment, round-trip
+  identity, generation identity, the D1a fidelity-boundary and ghost-handle
+  pins, fixed-step quanta/carry/drop arithmetic with mocked rAF and dyadic
+  stepMs). Suite: 187 tests, 183 run everywhere, 4 gc-gated.
+- t0: round-trip law block (same-clock capture/restore vs uninterrupted,
+  loop/pingPong + k-fold-adjacent capture, byte-equal snapshots + fire
+  counts).
+- t5: new `runMirror()` fuzz -- 10,000 fuzzed capture points; each hydrates
+  a same-capacity standby clock and drives both with identical tail ops;
+  byte-equal snapshots at every checkpoint. The existing 100K-op oracle is
+  untouched.
+- t3: the rollback drill -- capacity 32, 8 pre-armed lanes (one-shot durs
+  7/13/50/0.3/1e9, loop durs 10/0.3, pingPong dur 8), 600-frame preallocated
+  snapshot ring, random rollback depths 1..60, re-advance with the same dts,
+  bit-equal trajectories AND index-equal refire logs, 1000 randomized runs;
+  plus hydrate guard fuzz (capacity/truncation/magic/format/canary).
+- t6: `rollback-window` gate -- 10K captures + periodic hydrates over
+  churning lanes at capacity 256, `maxMajor: 0, maxPauseMs: 4` -- passes
+  `major=0 minor=0 maxMs=0.00`.
+- t1: attachFixed stepMs/opts rows and hydrate bad-shape rows (class +
+  fragment pins).
+- t9: SIXTH control, `snap-omit-freeTop` -- a restore that omits freeTop is
+  driven through the round-trip law under post-hydrate churn and exits
+  non-zero (fail-before evidence in the session scratchpad; the faithful
+  restore is byte-equal, the omitting one diverges and trips
+  slot-conservation).
+
+### Performance
+
+Three runs per board on the same machine, same day (Node --expose-gc).
+Noise law: overlapping min/max OR mean delta < 10%.
+
+| cell | 1.3.0 mean (min..max) | 1.4.0 mean (min..max) | verdict |
+| -- | -- | -- | -- |
+| idle-advance | 58.64M (54.21..60.95) | 59.21M (53.49..62.66) | overlap |
+| active-lanes-1k | 354.70M (352.20..358.40) | 349.65M (341.40..353.93) | overlap |
+| lane-reads-tracked | 13.96M (13.00..14.80) | 13.71M (12.69..14.80) | overlap |
+| alloc-dispose-churn | 16.90M (16.74..17.12) | 17.02M (16.79..17.19) | overlap |
+| completion-fanout-100 | 7.27M (7.22..7.34) | 6.99M (6.90..7.09) | mean -3.8% |
+| attach-interval-once | 111.32K (106.69..116.08) | 107.05K (105.51..108.15) | overlap |
+| loop-cycle-100 | 119.19M (118.31..120.20) | 119.90M (119.79..120.02) | overlap |
+| snapshot-1024 | n/a (feature new) | 1.63M (1.56..1.74) | AFTER-only |
+
+All cells within the noise law; no tune needed. completion-fanout-100's
+-3.8% mean (ranges adjacent, not overlapping) has a known cold mechanism:
+that cell rebuilds a clock per iteration, and `createClock` now also
+allocates the 72-byte header buffer and the cached slab-view table --
+construction cost, not tick cost (the seven other cells, which share the
+tick path, are all inside their 1.3.0 ranges). snapshot-1024: ~0.61 us per
+50,248-byte capture, ~0.1 B/op measured retention over 50K captures.
+
+---
+
 ## 1.3.0 -- 2026-09-05
 
 The earned-surface release: clock-wide `timeScale`, `lane.seek()`/`restart()`,

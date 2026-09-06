@@ -459,6 +459,149 @@ export async function run() {
         assertThrows(function () { createClock({ growable: 1 }); }, TypeError, "growable must be a boolean (got number)", "t5 C-07 growable 1");
     }
     console.log("t5 fuzz: C-07 config-law gating (3 probe shapes throw with pinned fragments)");
+
+    await runMirror();
+}
+
+// ---------------------------------------------------------------------------
+// runMirror -- snapshot/hydrate mirror-pair fuzz (K5, A1/A2). SEPARATE from the
+// 100K oracle above: its callbacks are LOG-ONLY (no structural ops -- D1a). A
+// primary clock evolves under fuzzed non-topology ops; at 10K+ capture points it
+// is snapshotted, a virgin same-capacity clock is hydrated from the bytes, an
+// IDENTICAL clock-level tail (advance/advanceTo/timeScale + fixed-quanta bursts)
+// is applied to both, and their final snapshots must be byte-equal. Tail ops are
+// clock-level only because hydrate restores STATE, not handle objects, so the
+// standby has no lane handles. The standby stays byte-equal despite carrying no
+// callbacks because totalCompletions counts cycles independently of callbacks.
+// ---------------------------------------------------------------------------
+
+const MIRROR_CAP = 128;
+const MIRROR_LANES = 20;
+const MIRROR_POINTS = 10000;
+const mirrorLog = [];   // log-only callback sink (never compared; proves no structural side effect)
+
+function armMirror(c) {
+    const lanes = new Array(MIRROR_LANES);
+    for (let i = 0; i < MIRROR_LANES; i = (i + 1) | 0) {
+        const idx = i;
+        // Spread of dyadic and non-dyadic durations; ~1/3 loop, ~1/3 pingPong.
+        const dur = ((i * 7) % 97) + 0.5;
+        const opts = { duration: dur, onComplete: function () { mirrorLog.push(idx); } };
+        const m = i % 3;
+        if (m === 1) opts.loop = true;
+        else if (m === 2) opts.pingPong = true;
+        const l = c.lane(opts);
+        l.start();
+        lanes[i] = l;
+    }
+    return lanes;
+}
+
+function bytesEqualOrFail(a, b, point, label) {
+    if (a.length !== b.length) {
+        throw new AssertionError("t5 mirror DIVERGENCE seed=" + SEED + " point=" + point
+            + " -- " + label + " length a=" + a.length + " b=" + b.length);
+    }
+    for (let i = 0; i < a.length; i = (i + 1) | 0) {
+        if (a[i] !== b[i]) {
+            throw new AssertionError("t5 mirror DIVERGENCE seed=" + SEED + " point=" + point
+                + " -- " + label + " byte " + i + " a=" + a[i] + " b=" + b[i]);
+        }
+    }
+}
+
+async function runMirror() {
+    const rng = makeRng(SEED ^ 0x5bd1e995);
+    const primary = createClock({ capacity: MIRROR_CAP });
+    const handles = armMirror(primary);
+
+    const size = primary.snapshotSize();
+    const bufP = new Uint8Array(size);   // capture buffer (reused)
+    const bufA = new Uint8Array(size);   // primary final (reused)
+    const bufB = new Uint8Array(size);   // standby final (reused)
+
+    for (let point = 0; point < MIRROR_POINTS; point = (point + 1) | 0) {
+        // PRIMARY evolution: fuzzed non-topology ops (no lane()/dispose()).
+        const primaryOps = 1 + (rng() % 3);
+        for (let k = 0; k < primaryOps; k = (k + 1) | 0) {
+            const roll = rng() % 100;
+            if (roll < 45) {
+                let dt;
+                if (rng() % 17 === 0) dt = 0;
+                else if (rng() % 23 === 0) dt = 5000 + 0.5;   // suspend-scale jump
+                else dt = (rng() % 40) + ((rng() % 2 === 0) ? 0 : 0.5);
+                primary.advance(dt);
+            } else if (roll < 55) {
+                const delta = (rng() % 30) + ((rng() % 2 === 0) ? 0 : 0.5);
+                primary.advanceTo(primary.simTime + delta);
+            } else if (roll < 68) {
+                handles[rng() % MIRROR_LANES].start();
+            } else if (roll < 78) {
+                handles[rng() % MIRROR_LANES].pause();
+            } else if (roll < 86) {
+                handles[rng() % MIRROR_LANES].reverse();
+            } else if (roll < 94) {
+                const p = ((rng() % 120) - 10) + ((rng() % 2 === 0) ? 0 : 0.5);
+                handles[rng() % MIRROR_LANES].seek(p);
+            } else {
+                const TS = [0, 0.25, 1, 2, 4];
+                primary.timeScale = TS[rng() % 5];
+            }
+        }
+
+        // CAPTURE + hydrate a virgin standby of equal capacity.
+        primary.snapshot(bufP);
+        const standby = createClock({ capacity: MIRROR_CAP });
+        standby.hydrate(bufP);
+
+        // IDENTICAL clock-level tail on both worlds (incl. fixed-quanta bursts).
+        const tailOps = 1 + (rng() % 4);
+        for (let k = 0; k < tailOps; k = (k + 1) | 0) {
+            const roll = rng() % 100;
+            if (roll < 40) {
+                let dt;
+                if (rng() % 19 === 0) dt = 0;
+                else dt = (rng() % 45) + ((rng() % 2 === 0) ? 0 : 0.5);
+                primary.advance(dt);
+                standby.advance(dt);
+            } else if (roll < 55) {
+                const delta = (rng() % 35) + ((rng() % 2 === 0) ? 0 : 0.5);
+                primary.advanceTo(primary.simTime + delta);
+                standby.advanceTo(standby.simTime + delta);
+            } else if (roll < 80) {
+                // Fixed-quanta pattern: advance(stepMs) a whole number of times,
+                // mirroring an attachFixed drain (dyadic step so it is bit-exact).
+                const step = (rng() % 2 === 0) ? 16 : 8;
+                const n = 1 + (rng() % 6);
+                for (let q = 0; q < n; q = (q + 1) | 0) {
+                    primary.advance(step);
+                    standby.advance(step);
+                }
+            } else {
+                const TS = [0, 0.25, 1, 2, 4];
+                const v = TS[rng() % 5];
+                primary.timeScale = v;
+                standby.timeScale = v;
+            }
+        }
+
+        primary.snapshot(bufA);
+        standby.snapshot(bufB);
+        bytesEqualOrFail(bufA, bufB, point, "mirror tail snapshot");
+        standby.dispose();
+
+        if ((point & 4095) === 0) {
+            const inv = primary._invariant();
+            if (inv !== null) {
+                throw new AssertionError("t5 mirror seed=" + SEED + " point=" + point
+                    + " -- primary invariant: " + inv);
+            }
+        }
+    }
+
+    if (mirrorLog.length < 0) console.log("unreachable " + mirrorLog.length);   // keep log-sink live
+    console.log("t5 mirror: pass (seed=" + SEED + " points=" + MIRROR_POINTS
+        + " cap=" + MIRROR_CAP + " lanes=" + MIRROR_LANES + ")");
 }
 
 // Uniform engine-world adapter over the real clock.

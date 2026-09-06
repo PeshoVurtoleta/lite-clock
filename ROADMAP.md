@@ -659,7 +659,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-clock"
 version_target: 1.3.0
-status: implemented (pipeline complete 2026-09-05; awaiting /release 1.3.0)
+status: shipped (2026-09-06 -- published to npm as 1.3.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0
@@ -761,7 +761,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-clock"
 version_target: 1.4.0
-status: planned
+status: implemented (pipeline complete 2026-09-06; awaiting /release 1.4.0)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0

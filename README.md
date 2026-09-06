@@ -98,7 +98,7 @@ will build on for netcode replay.
 
 ## What you get
 
-- **Single-file ESM**, around 480 lines, [no runtime dependencies](./package.json)
+- **Single-file ESM**, around 1250 lines, [no runtime dependencies](./package.json)
   beyond the `lite-signal` peer dep
 - **SOA TypedArray pool**: `startTimes`, `durations`, `positions` as
   `Float64Array`, `flags` as `Uint8Array`, `activeList`/`activeIndex` for
@@ -115,12 +115,18 @@ will build on for netcode replay.
   so effects tracking `lane.done()` see the completion frame BEFORE the
   callback runs
 - **Throw-on-overflow by default**, growable opt-in (doubles up to 65534)
-- **Tick-source helpers**: `attachRAF()`, `attachInterval(ms)`, `detach()`.
-  Manual `advance(dt)` for deterministic tests
+- **Tick-source helpers**: `attachRAF()`, `attachInterval(ms)`,
+  `attachFixed(stepMs, opts?)`, `detach()`. Manual `advance(dt)` for
+  deterministic tests
 - **Reverse mode** that flips reporting without complicating the hot loop
 - **Timeline surface (1.3.0)**: `lane.seek()`/`restart()` authored edits,
   `loop`/`pingPong` lanes with a bit-exact overshoot carry (`onComplete` once
   per cycle), and `clock.stats(out?)` counters with a zero-alloc sink form
+- **Determinism keystone (1.4.0)**: `clock.snapshot(out)`/`hydrate(buf)` --
+  zero-allocation binary capture and bit-exact restore of the whole sim state
+  (rollback-ready by construction, the floor `lite-rollback` composes on) --
+  and `attachFixed(stepMs)`, a fixed-timestep driver whose catch-up cap
+  drops excess time loudly instead of spiraling
 - **Terminal, idempotent `dispose()`** that returns the frame signal's node to
   the lite-signal pool (no registry leak) and fails closed on later mutation
 - **MIT licensed**, ASCII-only source, [zero `any`](./Clock.d.ts)
@@ -179,6 +185,10 @@ SOA allocation             Float64Array startTimes
                            Uint16Array  completedIds (end-of-tick scratch)
                            Uint32Array  generations  (per-slot ABA tags)
                            Uint16Array  freeList     (stack of free IDs)
+                           72-byte header buffer + cached per-slab byte views
+                                        (1.4.0 snapshot plumbing; the views are
+                                        rebuilt at growth/materialization, the
+                                        cold sites)
                           --------------------------------------
 lazy SOA (1.3.0)           NOT allocated by createClock. Materialized once per
                            clock at first use, so a bare createClock()/dispose()
@@ -189,6 +199,8 @@ lazy SOA (1.3.0)           NOT allocated by createClock. Materialized once per
                                         first loop/pingPong lane)
                            Uint32Array  cycleCounts  (completed cycles per
                                         lane -- first loop/pingPong lane)
+                           (hydrate materializes all four up front when a
+                            restored state will need them)
                           --------------------------------------
 free-list seed             freeList[i] = capacity - 1 - i
                            (so pop yields IDs 0, 1, 2, ... in order)
@@ -282,6 +294,17 @@ Key invariants:
    state AND identical per-cycle `onComplete` fire counts (gated in torture
    t0; the accumulating variant is torture control #5 and demonstrably
    diverges).
+9. **The atomic-tick law covers capture.** `snapshot()` and `hydrate()`
+   mid-tick throw `LiteClockReentrancyError`. Outside a tick the completion
+   queue is provably empty -- which is why a snapshot need not carry it.
+10. **The round-trip law.** `snapshot -> hydrate -> advance(seq)` is
+    bit-identical to uninterrupted `advance(seq)` -- positions, flags,
+    generations, free-list order, carry state, counters, everything.
+    `hydrate` bumps no generations (handles minted before the capture stay
+    valid after restore), requires equal capacity, and preserves the live
+    `onComplete` table by id, so replayed completions REFIRE (gated in
+    torture t0/t5 and a 1000-run rollback drill; the freeTop-omitting
+    restore is torture control #6 and demonstrably diverges).
 
 ---
 
@@ -465,11 +488,13 @@ On a disposed clock `frame()` and `frame.peek()` return the frozen `simTime`
 `LiteClockDisposedError` -- a subscription on a dead clock could never fire
 again (every `advance()` throws), so a silent no-op subscriber would be a trap.
 
-### clock.attachRAF / attachInterval / detach
+### clock.attachRAF / attachInterval / attachFixed / detach
 
 ```ts
 clock.attachRAF();              // drive from requestAnimationFrame
 clock.attachInterval(ms);       // drive from setInterval
+clock.attachFixed(stepMs);      // fixed-timestep accumulator over rAF
+clock.attachFixed(stepMs, { maxSubSteps: 4 });
 clock.detach();                 // cancel any attached source
 ```
 
@@ -477,6 +502,21 @@ Each attach replaces any prior one. `attachRAF` computes `dt` from the
 rAF timestamp; `attachInterval` computes `dt` from `performance.now()` between
 fires. `setInterval` handles are `.unref()`'d in Node so they don't block
 process exit.
+
+`attachFixed` (1.4.0) is the deterministic driver -- the accumulator every
+deterministic consumer hand-rolls wrong once. Real frame time accrues; the
+sim advances ONLY in exact `stepMs` quanta, each through the public
+`advance()` (so the sim quantum is `stepMs * timeScale` and slow-motion
+composes). The sub-quantum remainder always carries. `maxSubSteps`
+(default 8) caps catch-up after a stall or tab suspend: excess WHOLE quanta
+are DROPPED -- never fed to the sim -- and counted exactly in
+`stats().droppedMs`. That is the spiral-of-death guard, and it fails closed:
+dropped time is visible, never silently simulated. Validation fails closed
+too: disposed -> `LiteClockDisposedError`; `stepMs` must be a finite number
+> 0 (`RangeError`); `opts` follows the config law (unknown key ->
+`TypeError` with a did-you-mean hint; `maxSubSteps` must be an integer
+>= 1). Throws where rAF is unavailable (plain Node) -- drive tests with
+`advance()` directly.
 
 ### clock.dispose
 
@@ -491,9 +531,11 @@ bumped, so every outstanding handle proves stale). Idempotent.
 Dispose is terminal, NOT a reset. `simTime` and `ticks` FREEZE at their last
 values -- they do not rewind (reading a frozen count is more honest than a
 silently-rewound zero). After dispose the mutation surface fails closed:
-`advance`, `advanceTo`, `lane`, `attachRAF`, `attachInterval`, and
-`frame.subscribe` throw `LiteClockDisposedError`. `frame()` and `frame.peek()`
-return the frozen `simTime` (never `undefined`). `detach()` and `dispose()`
+`advance`, `advanceTo`, `lane`, `attachRAF`, `attachInterval`, `attachFixed`,
+`hydrate`, and `frame.subscribe` throw `LiteClockDisposedError`. `frame()` and
+`frame.peek()` return the frozen `simTime` (never `undefined`), and the read
+surface (`stats`, `snapshotSize`, `snapshot`) stays readable -- the frozen
+state is still a fact. `detach()` and `dispose()`
 stay idempotent no-ops. A `dispose()` from an effect/subscriber firing during a
 tick is legal: the in-flight tick completes, then the next mutation throws.
 
@@ -523,15 +565,83 @@ clock.stats(): ClockStats;          // allocating convenience form
 clock.stats(out): ClockStats;       // fills `out` in place -- zero allocation
 ```
 
-Seven counter fields: `poolUsed`, `poolFree`, `peakActive` (high-water
+Eight counter fields: `poolUsed`, `poolFree`, `peakActive` (high-water
 active-lane count, monotone), `totalTicks`, `totalCompletions` (completed
 CYCLES -- a multi-cycle advance counts them all, callback-less lanes count
-too), `capacity`, `timeScale`. With `out` present it must be a non-null
+too), `capacity`, `timeScale`, `droppedMs` (real ms dropped by
+`attachFixed`'s catch-up cap; 0 unless attachFixed has dropped; driver
+state, so a `hydrate` never touches it). With `out` present it must be a non-null
 object (else `TypeError`); the sink is filled and returned with zero
 allocation (gated in torture t6's churn window), so it is safe in a HUD loop.
 Without `out` a fresh object is allocated -- the documented convenience form.
 stats stays readable after `dispose()`: counters and timeScale freeze, and
 the pool reads as empty (dispose retires every lane). Feeds `lite-devtools`.
+
+### clock.snapshotSize / snapshot / hydrate
+
+```ts
+clock.snapshotSize(): number;          // 72 + 49 * capacity, exact
+clock.snapshot(out: Uint8Array): number;   // capture; returns bytes written
+clock.hydrate(buf: Uint8Array): void;      // restore onto THIS clock
+```
+
+The 1.4.0 determinism keystone: capture and restore of ALL replay-observable
+sim state, built for a rollback consumer that captures EVERY frame.
+
+**What a snapshot holds.** A versioned 72-byte header (magic, format
+version, capacity, endianness canary), seven `f64` scalars (`simTime`,
+`timeScale`, `tickCount`, `totalCompletions`, `peakActive`, `activeCount`,
+`freeTop`), then the ten SOA slabs packed back-to-back (`startTimes`,
+`baseStartTimes`, `durations`, `positions`, `flags`, `generations`,
+`activeList`, `activeIndex`, `freeList`, `cycleCounts`). NOT captured, on
+purpose: `onComplete` functions (not serializable -- the LIVE table is kept
+by id, see the refire contract below), attach/driver state (`droppedMs`
+included -- a driver is not sim state), and the completion queue (provably
+empty outside a tick, and capture is illegal mid-tick).
+
+**NOT a wire format.** Slabs are copied in NATIVE byte order and the header
+carries an endianness canary that `hydrate` validates -- a snapshot is a
+same-agent restore artifact, not a cross-machine message. Cross-peer state
+sync is a future `lite-room` contract, deliberately out of scope here.
+
+**Zero-allocation capture.** `snapshot(out)` fills a persistent header
+buffer and memcpy's each slab through cached internal byte views -- about a
+dozen `TypedArray.set()` calls, nothing allocated, ~0.6 us at the default
+1024 capacity (see Benchmarks). No view is ever created over `out`, so `out`
+may sit at ANY byte offset -- a `lite-rollback` ring slot (an
+arbitrary-offset subview of one backing buffer) works as-is. Throws:
+mid-tick -> `LiteClockReentrancyError`; non-`Uint8Array` -> `TypeError`;
+short buffer -> `RangeError` (a longer buffer is legal -- ring strides may
+pad). Readable on a disposed clock, like every read surface.
+
+**Fail-closed restore.** `hydrate(buf)` walks a nine-guard ladder with NO
+mutation until every guard passes: disposed -> `LiteClockDisposedError`;
+mid-tick -> `LiteClockReentrancyError`; non-`Uint8Array` -> `TypeError`;
+short header -> `RangeError`; bad magic, unsupported format, or endian-canary
+mismatch -> `TypeError` naming the field; capacity mismatch -> `RangeError`
+naming both (the SAME capacity is required -- growth mid-rollback is not a
+thing); short buffer -> `RangeError`. The restore path allocates ~10
+short-lived subarray views (minor-GC fodder only); the per-frame side --
+capture -- allocates nothing.
+
+**The refire contract (read this one).** `hydrate` bumps NO generations:
+handles minted before a same-clock capture stay valid after restore -- that
+identity is the point. The live `onComplete` table is preserved by id, so
+rolling back past a completion and re-advancing FIRES IT AGAIN. That is
+correct rollback semantics -- the callback observes the timeline that ends up
+being real -- and it makes one demand of the consumer: `onComplete` side
+effects must be rollback-aware or idempotent. Two documented boundaries:
+refire fidelity is exact only across a rollback window containing no
+`lane()`/`dispose()` (a slot disposed or re-tenanted inside the window has
+lost or replaced its callback), and a handle minted AFTER the capture
+addresses whatever the restore puts in its slot (roll back state, not lane
+inventory). `lite-rollback`'s fixed-topology field model never hits either
+boundary.
+
+**The round-trip law** (torture-gated at fuzzed capture points, plus a
+1000-run rollback drill): `snapshot -> hydrate -> advance(seq)` is
+bit-identical to `advance(seq)` uninterrupted -- loop/pingPong carry state
+included.
 
 ### LiteClockCapacityError
 
@@ -642,6 +752,19 @@ default registry. At 1024 clocks (the default registry capacity), creating
 the next one throws `CapacityError`. Now fixed; covered by
 [`test/11-dispose-leak.test.mjs`](./test/11-dispose-leak.test.mjs).
 
+### A rolled-back completion fires again
+
+`hydrate` restores state, not history. Roll a clock back past a completion
+and re-advance: the completion happens again in the replayed timeline, and
+its `onComplete` FIRES AGAIN -- the callback observes the timeline that ends
+up being real. This is the rollback semantic `lite-rollback` needs, and it
+is a contract, not a bug: `onComplete` side effects must be rollback-aware
+or idempotent. The boundary is documented too -- refire fidelity is exact
+only across windows containing no `lane()`/`dispose()` (a disposed slot's
+callback is gone; a re-tenanted slot's callback belongs to the new tenant).
+Fixed lane topology across a rollback window -- `lite-rollback`'s own field
+model -- never hits the boundary.
+
 [changelog]: ./CHANGELOG.md
 
 ---
@@ -653,25 +776,34 @@ Measured on Node 22.x x64, `--expose-gc`. Numbers are
 lane-tick, per alloc/dispose cycle). Retention is GC-corrected steady-state.
 
 ```
-idle-advance                                   16.31M ops/s   retained:   17.30 KB   (0.0177 B/op)
-active-lanes-1k                               117.94M ops/s   retained:    1.04 KB   (0.0001 B/op)
-lane-reads-tracked                              3.08M ops/s   retained:   95.07 KB   (0.0974 B/op)
-alloc-dispose-churn                             4.70M ops/s   retained:   25.94 KB   (0.1328 B/op)
-completion-fanout-100                           8.29M ops/s   retained:    1.94 KB   (0.0040 B/op)
-attach-interval-once                            7.75K ops/s   one-time setup cost
+idle-advance                                   62.66M ops/s   retained:   14.31 KB   (0.0147 B/op)
+active-lanes-1k                               353.62M ops/s   retained:       96 B   (0.0000 B/op)
+lane-reads-tracked                             14.80M ops/s   retained:   62.03 KB   (0.0635 B/op)
+alloc-dispose-churn                            17.19M ops/s   retained:      368 B   (0.0018 B/op)
+completion-fanout-100                           7.09M ops/s   retained:   16.88 KB   (0.0346 B/op)
+attach-interval-once                          105.51K ops/s   retained: -859.80 KB   (one-time setup)
+loop-cycle-100                                120.02M ops/s   retained:    3.22 KB   (0.0033 B/op)
+snapshot-1024                                   1.56M ops/s   retained:    4.84 KB   (0.0992 B/op)
 ```
 
 Reading the table:
 
-- `active-lanes-1k`: 117.94M *lane-ticks* per second -- a single 1ms slice
+- `active-lanes-1k`: ~354M *lane-ticks* per second -- a single 1ms slice
   of simulation advancing all 1000 lanes. The hot loop is one TypedArray
   scan + write-back per lane.
-- `lane-reads-tracked`: 3.08M *frame-ticks* per second with one effect tracking
+- `lane-reads-tracked`: ~15M *frame-ticks* per second with one effect tracking
   three reads (position + t + done). Per "op" includes signal write, effect
   dispatch, three signal reads, three TypedArray loads.
-- `alloc-dispose-churn`: 4.70M lane create/dispose cycles per second. Bound
+- `alloc-dispose-churn`: ~17M lane create/dispose cycles per second. Bound
   by `new LaneHandle()` -- a small object allocation per lane. Pooled handles
   are a roadmap item.
+- `loop-cycle-100`: 100 loop lanes each completing one cycle per advance --
+  the bit-exact carry recompute runs 100 times per iteration and still holds
+  ~120M lane-cycles per second.
+- `snapshot-1024`: one FULL state capture of a 1024-capacity clock (50,248
+  bytes: header + 7 scalars + 10 slabs) into a preallocated buffer, ~1.56M
+  captures per second (~0.64 us each) with zero allocation -- the per-frame
+  rollback pattern this call was built for.
 
 Run the full bench yourself:
 
@@ -687,7 +819,8 @@ Three tiers, all run by `npm run verify`:
 
 ### Tier 1 -- Behavior (unit tests, fast)
 
-`npm test` -- 84 functional tests under [`test/`](./test/):
+`npm test` -- 187 functional tests under [`test/`](./test/) (183 run
+everywhere, 4 gc-gated):
 
 - `01-create.test.mjs` -- config validation, capacity bounds, frozen surface
 - `02-advance.test.mjs` -- dt validation, simTime accumulation, frame signal,
@@ -705,6 +838,15 @@ Three tiers, all run by `npm run verify`:
 - `09-determinism.test.mjs` -- same dt sequence yields identical state
 - `11-dispose-leak.test.mjs` -- 4096 create/dispose cycles do not leak
   lite-signal nodes
+- `12-version-sync.test.mjs` -- three-place version sync, frozen surface keys
+- `13-config-law.test.mjs` -- unknown-key rejection with did-you-mean hints
+- `14-timescale.test.mjs` / `15-seek-restart.test.mjs` /
+  `16-loop-pingpong.test.mjs` / `17-stats.test.mjs` -- the 1.3.0 timeline
+  surface, boundary-by-boundary
+- `18-snapshot.test.mjs` -- snapshot/hydrate guard ladders, round-trip
+  identity, the refire contract and its documented boundaries
+- `19-attach-fixed.test.mjs` -- fixed-step quanta, remainder carry, the
+  drop counter, opts law (mocked rAF, dyadic stepMs)
 
 ### Tier 2 -- Memory (allocation-free verification)
 
@@ -717,7 +859,7 @@ Three tiers, all run by `npm run verify`:
 
 ### Tier 3 -- Performance (measured throughput)
 
-`npm run bench` -- six scenarios with retention budget, see above.
+`npm run bench` -- eight scenarios with retention budget, see above.
 
 ---
 
@@ -737,6 +879,9 @@ Three tiers, all run by `npm run verify`:
   call is synchronous. Async coordination belongs upstream.
 - **Not a renderer.** This library only computes lane positions. Reading
   those into DOM/canvas/WebGL is your job.
+- **Not a wire format.** `snapshot()` produces a same-agent, canary-guarded
+  native-endian artifact for capture/rollback on the machine that made it.
+  Cross-peer or cross-machine state sync is a future `lite-room` contract.
 
 ---
 

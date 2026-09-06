@@ -1,4 +1,4 @@
-// @zakkster/lite-clock 1.3.0
+// @zakkster/lite-clock 1.4.0
 // Zero-GC simulation/timeline engine for @zakkster/lite-signal.
 //
 // SOA TypedArray lane pool. Deterministic advance(dt) -- the only mutation
@@ -26,6 +26,15 @@ const FLAG_DONE = 1 << 2;               // lane reached its duration
 const FLAG_REVERSE = 1 << 3;               // direction inverted for reporting
 const FLAG_LOOP = 1 << 4;               // lane wraps at duration (never DONE)
 const FLAG_PINGPONG = 1 << 5;               // lane wraps + flips REVERSE per cycle
+
+// Snapshot binary format (see decisions/0004-snapshot.md). Same-agent, native-
+// endian, canary-guarded -- NOT a wire format. Header is 72 bytes (four u32 +
+// seven f64 scalars); each lane costs 49 bytes across the ten D1-order slabs.
+const SNAP_FORMAT = 1;
+const SNAP_MAGIC = 0x4C43534E;              // "LCSN"
+const SNAP_ENDIAN = 0x01020304;             // native-endian canary
+const SNAP_HEADER_BYTES = 72;
+const SNAP_BYTES_PER_LANE = 49;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -75,6 +84,7 @@ class LiteClockDisposedError extends Error {
 // Data-driven known-key lists so a future option is one array entry, not code.
 const KNOWN_CLOCK_KEYS = ["capacity", "growable"];
 const KNOWN_LANE_KEYS = ["duration", "onComplete", "loop", "pingPong"];
+const KNOWN_FIXED_KEYS = ["maxSubSteps"];
 
 // Hand-rolled two-row O(n*m) Levenshtein. Only ever called on the throw path
 // (once per unknown key), so its allocation of two small Int arrays is cold.
@@ -241,6 +251,11 @@ function createClock(config) {
     // ---- Tick-source bookkeeping ------------------------------------------
     let detachFn = null;
     let lastRealTime = 0;
+    // Fixed-step driver drop counter (D5/D6): whole quanta discarded after the
+    // maxSubSteps cap is hit (a tab-suspend catch-up). Real-time observability
+    // reported by stats(); NOT sim state -- frozen at dispose, never reset,
+    // absent from the snapshot.
+    let droppedMs = 0;
     // Re-entrancy guard: set true across a tick, cleared in advance()'s finally.
     // The tick (compaction -> frame propagation -> callback drain) is atomic; a
     // nested advance()/advanceTo() from a callback, effect, or subscriber throws.
@@ -267,6 +282,39 @@ function createClock(config) {
         flags: flags,
         generations: generations
     };
+
+    // ---- Snapshot plumbing (see decisions/0004-snapshot.md) ---------------
+    // Persistent 72-byte header buffer (the clock's own ArrayBuffer, aligned by
+    // construction) with typed views: four u32 (magic/format/capacity/canary)
+    // then seven f64 scalars. snapshot() fills these and copies the whole header
+    // with one set(); hydrate() reads the canary/capacity/scalars back out
+    // through the same route.
+    const hdrBuf = new ArrayBuffer(SNAP_HEADER_BYTES);
+    const hdrU32 = new Uint32Array(hdrBuf, 0, 4);
+    const hdrF64 = new Float64Array(hdrBuf, 16, 7);
+    const hdrU8 = new Uint8Array(hdrBuf);
+
+    // Cached Uint8Array view over every slab's buffer, in D1 order. Rebuilt only
+    // at cold sites (construction, growth, materialization) -- a stale view
+    // after a realloc is silent corruption, so rebuildViews() runs at EVERY site
+    // that reassigns or materializes a slab in this table. The two lazy slabs
+    // (baseStartTimes, cycleCounts) read null until materialized; snapshot
+    // writes a zero section for a null slot (bit-identical to materialized
+    // zeros). The queue scratch slabs are NOT in this table (D1: never captured).
+    const slabU8 = [null, null, null, null, null, null, null, null, null, null];
+    function rebuildViews() {
+        slabU8[0] = new Uint8Array(startTimes.buffer);
+        slabU8[1] = baseStartTimes !== null ? new Uint8Array(baseStartTimes.buffer) : null;
+        slabU8[2] = new Uint8Array(durations.buffer);
+        slabU8[3] = new Uint8Array(positions.buffer);
+        slabU8[4] = new Uint8Array(flags.buffer);
+        slabU8[5] = new Uint8Array(generations.buffer);
+        slabU8[6] = new Uint8Array(activeList.buffer);
+        slabU8[7] = new Uint8Array(activeIndex.buffer);
+        slabU8[8] = new Uint8Array(freeList.buffer);
+        slabU8[9] = cycleCounts !== null ? new Uint8Array(cycleCounts.buffer) : null;
+    }
+    rebuildViews();
 
     // ---- Growth (rebinds SOA arrays) --------------------------------------
     function ensureCapacity() {
@@ -337,6 +385,8 @@ function createClock(config) {
         soa.durations = durations;
         soa.flags = flags;
         soa.generations = generations;
+        // Every slab was reallocated: the cached snapshot views are now stale.
+        rebuildViews();
     }
 
     // ---- Lane lifecycle (operates on integer IDs) -------------------------
@@ -679,6 +729,78 @@ function createClock(config) {
         };
     }
 
+    // Fixed-timestep accumulator driver (D5). Feeds the PUBLIC advance(stepMs)
+    // a whole number of times per frame; the sim quantum is stepMs * timeScale.
+    // The maxSubSteps cap is the spiral-of-death guard: excess whole quanta are
+    // dropped (never fed) and counted in droppedMs; the sub-quantum remainder
+    // always carries -- that is the determinism point.
+    function attachFixed(stepMs, opts) {
+        if (disposed) throw new LiteClockDisposedError();
+        if (typeof stepMs !== "number" || !Number.isFinite(stepMs) || stepMs <= 0) {
+            throw new RangeError(
+                "clock.attachFixed: stepMs must be a finite number > 0 (got " + stepMs + ")"
+            );
+        }
+        let maxSubSteps = 8;
+        if (opts !== undefined && opts !== null) {
+            if (typeof opts !== "object") {
+                throw new TypeError("clock.attachFixed: opts must be an object");
+            }
+            validateKeys(opts, KNOWN_FIXED_KEYS, "clock.attachFixed");
+            if (opts.maxSubSteps !== undefined) {
+                const m = opts.maxSubSteps;
+                if (typeof m !== "number") {
+                    throw new TypeError(
+                        "clock.attachFixed: maxSubSteps must be a number (got "
+                        + (m === null ? "null" : typeof m) + ")"
+                    );
+                }
+                if (!Number.isInteger(m) || m < 1) {
+                    throw new RangeError(
+                        "clock.attachFixed: maxSubSteps must be an integer >= 1 (got " + m + ")"
+                    );
+                }
+                maxSubSteps = m;
+            }
+        }
+        if (detachFn !== null) detachFn();
+        if (typeof requestAnimationFrame !== "function") {
+            throw new Error("clock.attachFixed: requestAnimationFrame is not available in this runtime");
+        }
+        let running = true;
+        let acc = 0;
+        lastRealTime = nowMs();
+
+        function fixedTick(now) {
+            if (!running) return;
+            const realDt = now - lastRealTime;
+            lastRealTime = now;
+            if (realDt > 0) acc = acc + realDt;
+            let n = Math.floor(acc / stepMs);
+            if (n > maxSubSteps) n = maxSubSteps;
+            // Break on disposed/!running: an onComplete may dispose the clock
+            // mid-drain, and advance() would otherwise throw out of this frame.
+            for (let i = 0; i < n; i = (i + 1) | 0) {
+                if (!running || disposed) break;
+                advance(stepMs);
+            }
+            // ONE multiply, never repeated subtraction.
+            acc = acc - n * stepMs;
+            if (acc >= stepMs) {
+                const d = acc - (acc % stepMs);
+                droppedMs = droppedMs + d;
+                acc = acc % stepMs;
+            }
+            requestAnimationFrame(fixedTick);
+        }
+
+        detachFn = () => {
+            running = false;
+            detachFn = null;
+        };
+        requestAnimationFrame(fixedTick);
+    }
+
     function detach() {
         if (detachFn !== null) detachFn();
     }
@@ -851,6 +973,8 @@ function createClock(config) {
         if (mode !== 0 && baseStartTimes === null) {
             baseStartTimes = new Float64Array(capacity);
             cycleCounts = new Uint32Array(capacity);
+            // Two lazy slabs just materialized: refresh their cached views.
+            rebuildViews();
         }
         const id = allocLane(dur, oc, mode);
         return new LaneHandle(instance, id, generations[id]);
@@ -874,7 +998,140 @@ function createClock(config) {
         out.totalCompletions = totalCompletions;
         out.capacity = capacity;
         out.timeScale = timeScale;
+        out.droppedMs = droppedMs;
         return out;
+    }
+
+    // ---- Snapshot / hydrate (D2/D3, see decisions/0004-snapshot.md) -------
+    // Byte size of a snapshot at the CURRENT capacity. Pure read: legal on a
+    // disposed clock (the frozen state shape is still a fact).
+    function snapshotSize() {
+        return SNAP_HEADER_BYTES + capacity * SNAP_BYTES_PER_LANE;
+    }
+
+    // Capture all replay-observable sim state into `out` (D1). Strictly zero-
+    // allocation: fill the persistent header, one out.set() for it, then one
+    // set()/fill(0) per slab. Readable on a disposed clock; illegal mid-tick.
+    function snapshot(out) {
+        if (advancing) throw new LiteClockReentrancyError();
+        if (!(out instanceof Uint8Array)) {
+            throw new TypeError("clock.snapshot: out must be a Uint8Array");
+        }
+        const need = SNAP_HEADER_BYTES + capacity * SNAP_BYTES_PER_LANE;
+        if (out.byteLength < need) {
+            throw new RangeError(
+                "clock.snapshot: out too small (need " + need + " bytes, got "
+                + out.byteLength + ")"
+            );
+        }
+        hdrU32[0] = SNAP_MAGIC;
+        hdrU32[1] = SNAP_FORMAT;
+        hdrU32[2] = capacity;
+        hdrU32[3] = SNAP_ENDIAN;
+        hdrF64[0] = simTime;
+        hdrF64[1] = timeScale;
+        hdrF64[2] = tickCount;
+        hdrF64[3] = totalCompletions;
+        hdrF64[4] = peakActive;
+        hdrF64[5] = activeCount;
+        hdrF64[6] = freeTop;
+        out.set(hdrU8, 0);
+        const cap = capacity;
+        let off = SNAP_HEADER_BYTES;
+        out.set(slabU8[0], off); off = off + cap * 8;                    // startTimes
+        if (slabU8[1] !== null) out.set(slabU8[1], off);
+        else out.fill(0, off, off + cap * 8);
+        off = off + cap * 8;                                             // baseStartTimes (lazy)
+        out.set(slabU8[2], off); off = off + cap * 8;                    // durations
+        out.set(slabU8[3], off); off = off + cap * 8;                    // positions
+        out.set(slabU8[4], off); off = off + cap;                       // flags
+        out.set(slabU8[5], off); off = off + cap * 4;                    // generations
+        out.set(slabU8[6], off); off = off + cap * 2;                    // activeList
+        out.set(slabU8[7], off); off = off + cap * 4;                    // activeIndex
+        out.set(slabU8[8], off); off = off + cap * 2;                    // freeList
+        if (slabU8[9] !== null) out.set(slabU8[9], off);
+        else out.fill(0, off, off + cap * 4);
+        off = off + cap * 4;                                             // cycleCounts (lazy)
+        return need;
+    }
+
+    // Restore sim state from a same-agent snapshot (D3/R2). Guard ladder is
+    // state-first (disposed -> advancing) then shape/header/size; NO mutation
+    // until all nine guards pass. Materializes the four lazy arrays if this is a
+    // virgin clock receiving cycling-lane state, BEFORE any slab restore, and
+    // rebuilds the cached views. The copy-in uses exactly 10 buf.subarray
+    // wrappers (documented minor-GC fodder on the restore path).
+    function hydrate(buf) {
+        if (disposed) throw new LiteClockDisposedError();
+        if (advancing) throw new LiteClockReentrancyError();
+        if (!(buf instanceof Uint8Array)) {
+            throw new TypeError("clock.hydrate: buf must be a Uint8Array");
+        }
+        if (buf.byteLength < SNAP_HEADER_BYTES) {
+            throw new RangeError(
+                "clock.hydrate: buf too small for header (need " + SNAP_HEADER_BYTES
+                + " bytes, got " + buf.byteLength + ")"
+            );
+        }
+        // View-free 72-byte header copy-in, then read the fields back out.
+        for (let i = 0; i < SNAP_HEADER_BYTES; i = (i + 1) | 0) hdrU8[i] = buf[i];
+        if (hdrU32[0] !== SNAP_MAGIC) {
+            throw new TypeError("clock.hydrate: bad magic (not a lite-clock snapshot)");
+        }
+        if (hdrU32[1] !== SNAP_FORMAT) {
+            throw new TypeError(
+                "clock.hydrate: unsupported snapshot format " + hdrU32[1]
+                + " (this build reads format " + SNAP_FORMAT + ")"
+            );
+        }
+        if (hdrU32[3] !== SNAP_ENDIAN) {
+            throw new TypeError(
+                "clock.hydrate: endian canary mismatch (foreign-endian snapshot)"
+            );
+        }
+        const cap = hdrU32[2];
+        if (cap !== capacity) {
+            throw new RangeError(
+                "clock.hydrate: capacity mismatch (snapshot " + cap + ", clock "
+                + capacity + ")"
+            );
+        }
+        const need = SNAP_HEADER_BYTES + capacity * SNAP_BYTES_PER_LANE;
+        if (buf.byteLength < need) {
+            throw new RangeError(
+                "clock.hydrate: buf too small (need " + need + " bytes, got "
+                + buf.byteLength + ")"
+            );
+        }
+        // All guards passed -- materialize lazy arrays BEFORE slab restore.
+        if (baseStartTimes === null) {
+            baseStartTimes = new Float64Array(capacity);
+            cycleCounts = new Uint32Array(capacity);
+        }
+        if (completedCycles === null) {
+            completedCycles = new Uint32Array(capacity);
+            completedGens = new Uint32Array(capacity);
+        }
+        rebuildViews();
+        simTime = hdrF64[0];
+        timeScale = hdrF64[1];
+        tickCount = hdrF64[2];
+        totalCompletions = hdrF64[3];
+        peakActive = hdrF64[4];
+        activeCount = hdrF64[5];
+        freeTop = hdrF64[6];
+        const cc = capacity;
+        let off = SNAP_HEADER_BYTES;
+        slabU8[0].set(buf.subarray(off, off + cc * 8)); off = off + cc * 8;
+        slabU8[1].set(buf.subarray(off, off + cc * 8)); off = off + cc * 8;
+        slabU8[2].set(buf.subarray(off, off + cc * 8)); off = off + cc * 8;
+        slabU8[3].set(buf.subarray(off, off + cc * 8)); off = off + cc * 8;
+        slabU8[4].set(buf.subarray(off, off + cc));     off = off + cc;
+        slabU8[5].set(buf.subarray(off, off + cc * 4)); off = off + cc * 4;
+        slabU8[6].set(buf.subarray(off, off + cc * 2)); off = off + cc * 2;
+        slabU8[7].set(buf.subarray(off, off + cc * 4)); off = off + cc * 4;
+        slabU8[8].set(buf.subarray(off, off + cc * 2)); off = off + cc * 2;
+        slabU8[9].set(buf.subarray(off, off + cc * 4)); off = off + cc * 4;
     }
 
     function clockDispose() {
@@ -923,8 +1180,12 @@ function createClock(config) {
         frame: frame,
         attachRAF: attachRAF,
         attachInterval: attachInterval,
+        attachFixed: attachFixed,
         detach: detach,
         dispose: clockDispose,
+        snapshotSize: snapshotSize,
+        snapshot: snapshot,
+        hydrate: hydrate,
         get simTime() {
             return simTime;
         },
@@ -969,6 +1230,7 @@ function createClock(config) {
     // phases. Reads the CURRENT closure bindings so it sees growth-rebound
     // arrays. Returns null when every invariant holds, else a short string
     // naming the first violated line (see ROADMAP.md section 2).
+    let invariantSeen = null;
     Object.defineProperty(instance, "_invariant", {
         value: function () {
             let allocCount = 0;
@@ -983,6 +1245,23 @@ function createClock(config) {
                 const active = (flags[id] & FLAG_ACTIVE) !== 0;
                 if (active !== (activeIndex[id] !== NO_INDEX)) return "active-flag-index-agreement";
             }
+            // Line 4: every free-list entry in [0, freeTop) is in-bounds, not
+            // allocated, and unique. The first three lines cannot see a
+            // duplicated or alloc-pointing free entry -- the corruption class a
+            // partial or unfaithful hydrate would introduce. The seen-map is
+            // lazy and reused (test hook; never inside a gated gc window).
+            if (invariantSeen === null || invariantSeen.length < capacity) {
+                invariantSeen = new Uint8Array(capacity);
+            } else {
+                invariantSeen.fill(0, 0, capacity);
+            }
+            for (let i = 0; i < freeTop; i = (i + 1) | 0) {
+                const entry = freeList[i];
+                if (entry >= capacity) return "free-list-coherence";
+                if ((flags[entry] & FLAG_ALLOC) !== 0) return "free-list-coherence";
+                if (invariantSeen[entry] !== 0) return "free-list-coherence";
+                invariantSeen[entry] = 1;
+            }
             return null;
         },
         enumerable: false
@@ -995,6 +1274,6 @@ function createClock(config) {
 // Exports
 // ---------------------------------------------------------------------------
 
-const VERSION = "1.3.0";
+const VERSION = "1.4.0";
 
 export {createClock, LiteClockCapacityError, LiteClockReentrancyError, LiteClockDisposedError, VERSION};

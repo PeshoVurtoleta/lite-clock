@@ -1,13 +1,13 @@
 # @zakkster/lite-clock
 
-Version: 1.3.0
+Version: 1.4.0
 
 Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray
 lane pool. Deterministic `advance(dt)` -- the only mutation entry point.
 Single force-propagate frame signal carrying simTime; lane reads pull values
 directly from TypedArrays so 10K lanes cost one signal write per tick.
 
-Single-file ESM, ~480 LOC, MIT, zero runtime deps, peer dep `lite-signal ^1.2.2`.
+Single-file ESM, ~1250 LOC, MIT, zero runtime deps, peer dep `lite-signal ^1.2.2`.
 
 ## Install
 
@@ -185,6 +185,24 @@ available (e.g. plain Node).
 Drive from `setInterval`. Computes dt from `performance.now()` between fires.
 Node-side handles are `.unref()`'d so they don't block process exit.
 
+### `clock.attachFixed(stepMs, opts?): void`
+
+Fixed-timestep rAF driver -- the determinism keystone driver, replacing the
+hand-rolled accumulator every deterministic consumer writes wrong once. Real
+frame time accrues in an accumulator; the PUBLIC `advance(stepMs)` is called
+a whole number of times per frame, so the sim only ever moves in exact
+`stepMs` quanta (scaled once by `timeScale` like every advance -- the sim
+quantum is `stepMs * timeScale`). The sub-quantum remainder ALWAYS carries.
+
+`opts.maxSubSteps` (default 8) caps catch-up after a stall or tab suspend:
+excess WHOLE quanta beyond the cap are DROPPED, never fed to the sim -- a
+spiral-of-death guard that fails closed -- and counted exactly in
+`stats().droppedMs` (real ms). Validation fails closed: disposed ->
+`LiteClockDisposedError`; `stepMs` must be a finite number > 0
+(`RangeError`); `opts` follows the config law (unknown key -> `TypeError`
+with a did-you-mean hint; `maxSubSteps` must be an integer >= 1). Throws
+where rAF is unavailable.
+
 ### `clock.detach(): void`
 
 Cancel any attached tick source. Idempotent.
@@ -232,6 +250,69 @@ readable after dispose (read surface; counters frozen). Fields, in order:
 - `totalCompletions: number` -- completed cycles (callback-less lanes count too)
 - `capacity: number`
 - `timeScale: number`
+- `droppedMs: number` -- real ms dropped by attachFixed's maxSubSteps cap
+  (0 unless attachFixed has dropped; driver state, never in a snapshot)
+
+### `clock.snapshotSize(): number`
+
+Exact byte length of a snapshot at the CURRENT capacity:
+`72 + 49 * capacity`. Pure read -- legal on a disposed clock. A growable
+clock's growth changes it.
+
+### `clock.snapshot(out: Uint8Array): number`
+
+Capture ALL replay-observable sim state into the caller's buffer; returns
+bytes written. Strictly ZERO-allocation -- per-frame rollback capture is the
+design case: slab bytes are memcpy'd through cached internal views, and no
+view is ever created over `out`, so `out` may sit at ANY byte offset (a
+lite-rollback ring slot works as-is).
+
+Scope: simTime, timeScale, tickCount, totalCompletions, peakActive,
+activeCount, freeTop + the ten SOA slabs (startTimes, baseStartTimes,
+durations, positions, flags, generations, activeList, activeIndex, freeList,
+cycleCounts). NOT captured: onComplete functions (the live table is kept by
+id -- see hydrate), attach/driver state (droppedMs included), the completion
+queue (provably empty outside a tick).
+
+Layout: versioned 72-byte header (magic, format version, capacity,
+endianness canary) + 7 f64 scalars + packed slabs. NATIVE endianness with a
+canary hydrate validates -- a snapshot is NOT a wire format (same-agent
+restore only; no cross-machine contract).
+
+Throws: mid-tick -> `LiteClockReentrancyError` (the atomic-tick law extends
+to capture); non-Uint8Array -> `TypeError`; short buffer -> `RangeError`
+(longer is legal). Readable on a disposed clock.
+
+### `clock.hydrate(buf: Uint8Array): void`
+
+Restore a snapshot onto THIS clock. Fail-closed guard ladder, in order, with
+NO mutation until every guard passes: disposed -> `LiteClockDisposedError`;
+mid-tick -> `LiteClockReentrancyError`; non-Uint8Array -> `TypeError`;
+short header -> `RangeError`; bad magic / unsupported format /
+endian-canary mismatch -> `TypeError` naming the field; capacity mismatch ->
+`RangeError` naming both (same capacity REQUIRED -- growth mid-rollback is
+not a thing); short buffer -> `RangeError`.
+
+hydrate bumps NO generations: handles minted before a same-clock snapshot
+stay valid after restore (that identity is the point). The live onComplete
+table is preserved by id, so restore + re-advance REFIRES completions that
+had fired in the rolled-back timeline -- onComplete side effects MUST be
+rollback-aware or idempotent; that is the consumer's contract. Refire
+fidelity is exact only across a rollback window containing no
+`lane()`/`dispose()`: a slot disposed or re-tenanted inside the window has
+lost or replaced its callback (the documented fidelity boundary). A handle
+minted AFTER the capture addresses whatever the restore puts in its slot
+(the ghost-handle hazard -- roll back state, not lane inventory). The
+restore path allocates ~10 short-lived subarray views (minor-GC only);
+capture is the zero-alloc side. Legal with a driver attached (the next
+driver tick advances the restored state); legal onto a same-capacity virgin
+clock (state transfers, handle objects do not).
+
+THE ROUND-TRIP LAW: `snapshot -> hydrate -> advance(seq)` is BIT-IDENTICAL
+to `advance(seq)` uninterrupted -- positions, flags, generations, free-list
+order, carry state, counters, everything -- at any capture point,
+loop/pingPong lanes included. Torture-gated across fuzzed capture points and
+a 1000-run rollback drill.
 
 ### `LiteClockCapacityError`
 
@@ -292,6 +373,13 @@ throws `LiteClockDisposedError`, never `LiteClockReentrancyError`. Reads
   present non-boolean `growable` throw `TypeError` with a did-you-mean hint.
 - `clock.dispose()` is required for bounded-lifetime clocks (releases the
   frame signal node back to the lite-signal pool).
+- The atomic-tick law covers capture: `snapshot()`/`hydrate()` mid-tick throw
+  `LiteClockReentrancyError`. Outside a tick the completion queue is provably
+  empty -- which is why a snapshot need not carry it.
+- The round-trip law: `snapshot -> hydrate -> advance(seq)` is bit-identical
+  to uninterrupted `advance(seq)`. hydrate bumps no generations, requires
+  equal capacity, and preserves the live onComplete table by id (refires are
+  the consumer's contract).
 
 ## Common patterns
 
@@ -331,6 +419,17 @@ throws `LiteClockDisposedError`, never `LiteClockReentrancyError`. Reads
     const ui  = createClock(); ui.attachRAF();          // 60fps animations
     const sim = createClock(); sim.attachInterval(8);   // 125Hz physics
 
+### Rollback capture/restore (lite-rollback-ready)
+
+    const clock = createClock({ capacity: 1024 });
+    const buf = new Uint8Array(clock.snapshotSize());   // preallocate once
+    // per frame:
+    clock.advance(16);
+    clock.snapshot(buf);          // zero-alloc capture (~0.7 us at cap 1024)
+    // on rollback:
+    clock.hydrate(buf);           // restore; existing handles stay valid
+    clock.advance(16);            // re-advance -- completions REFIRE
+
 ### Composition with lite-statechart
 
     const clock = createClock(); clock.attachRAF();
@@ -359,23 +458,29 @@ throws `LiteClockDisposedError`, never `LiteClockReentrancyError`. Reads
 - Not async (no promises, no microtasks)
 - Not a renderer (only computes lane positions)
 - Not a scheduler with priorities (all lanes advance at the clock's rate)
+- Not a wire format (snapshots are same-agent binary, canary-guarded;
+  cross-peer sync is a future lite-room contract, not this one)
 
 ## Deterministic testing
 
 `advance(dt)` is the sole mutation entry point. Inject any dt sequence twice
 in two fresh clocks and you get identical state. `attachRAF` and
 `attachInterval` are convenience wrappers that compute dt from real time and
-call `advance()`; tests should use `advance()` directly.
+call `advance()`; `attachFixed` is the deterministic driver (exact `stepMs`
+quanta, fail-closed drop counter); tests should use `advance()` directly.
+For capture/replay, `snapshot`/`hydrate` round-trip the full sim state
+bit-exactly -- see the round-trip law above.
 
 ## Files
 
-- `Clock.js` -- implementation (~480 lines, ESM)
+- `Clock.js` -- implementation (~1250 lines, ESM)
 - `Clock.d.ts` -- TypeScript declarations
-- `test/01..11` -- behavior, GC, dispose-leak regression suites
+- `test/01..19` -- behavior, GC, dispose-leak, snapshot, and fixed-step
+  regression suites
 - `test/torture.mjs` -- the authoritative memory + determinism gate
   (`node --expose-gc test/torture.mjs`; @zakkster/lite-leak +
   @zakkster/lite-gc-profiler; prints "ok" on success)
-- `bench/bench.mjs` -- six-scenario throughput + retention measurement
+- `bench/bench.mjs` -- eight-scenario throughput + retention measurement
 - `README.md` -- full architecture + integration recipes
 - `CHANGELOG.md` -- versioned change log
 - `ROADMAP.md` -- deferred features and rationale

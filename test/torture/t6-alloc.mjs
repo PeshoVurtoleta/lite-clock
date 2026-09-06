@@ -155,11 +155,57 @@ async function gateAllocDisposeChurn() {
         + " minor=" + s.gc.minor + " maxMs=" + s.gc.maxMs.toFixed(2) + ")");
 }
 
+// ---- rollback-window: snapshot every iter + periodic hydrate, maxMajor 0 ----
+// A rollback consumer captures every frame into a preallocated buffer and
+// occasionally restores. snapshot(buf) is strictly zero-alloc; hydrate spends 10
+// documented subarray wrappers (minor-GC fodder only). Both are gated here in
+// one window over a churning mixed live-lane state at maxMajor 0.
+async function gateRollbackWindow() {
+    const CAP = 256;
+    const LOOPS = 100;
+    const FINITES = 100;
+    const c = createClock({ capacity: CAP });
+    const finites = new Array(FINITES);
+    for (let i = 0; i < LOOPS; i = (i + 1) | 0) {
+        const l = c.lane({ duration: 2.5, loop: true });   // cycles every ~2.5 dt
+        l.start();
+    }
+    for (let i = 0; i < FINITES; i = (i + 1) | 0) {
+        const l = c.lane({ duration: 300 });
+        l.start();
+        finites[i] = l;
+    }
+
+    // Buffer preallocated OUTSIDE the measured window.
+    const buf = new Uint8Array(c.snapshotSize());
+
+    for (let i = 0; i < WARM; i = (i + 1) | 0) {
+        c.advance(1);
+        c.snapshot(buf);
+        if ((i % 500) === 499) c.hydrate(buf);
+    }
+
+    const s = await measure(function (gc) {
+        for (let i = 0; i < 10000; i = (i + 1) | 0) {
+            c.advance(1);
+            c.snapshot(buf);                       // per-iter capture -- zero-alloc
+            finites[i % FINITES].restart();        // cold churn (seek0 + start)
+            if ((i % 1000) === 999) c.hydrate(buf); // periodic restore -- 10 wrappers
+            if ((i & 1023) === 0) heapSample(gc, false);
+        }
+    });
+    assertPass(s, { maxMajor: 0, maxPauseMs: 4 }, "t6 rollback-window");
+    assert(c._invariant() === null, function () { return "t6 rollback-window invariant: " + c._invariant(); });
+    console.log("t6 rollback-window: pass (major=" + s.gc.major
+        + " minor=" + s.gc.minor + " maxMs=" + s.gc.maxMs.toFixed(2) + ")");
+}
+
 export async function run() {
     await gateAdvance1k();
     await gateTrackedReads();
     await gateCompletionFanout();
     await gateAllocDisposeChurn();
+    await gateRollbackWindow();
 }
 
 // ---- control: allocating advance-1k that MUST trip maxMajor: 0 -------------

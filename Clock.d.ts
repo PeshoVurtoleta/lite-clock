@@ -134,6 +134,24 @@ export interface Lane {
 }
 
 // ---------------------------------------------------------------------------
+// Fixed-step driver options
+// ---------------------------------------------------------------------------
+
+/**
+ * Options for clock.attachFixed(). Fails closed: an unknown key throws a
+ * TypeError with a did-you-mean hint.
+ */
+export interface FixedOptions {
+    /**
+     * Maximum sub-steps fed per frame -- the spiral-of-death cap. Excess whole
+     * quanta beyond this are DROPPED (never fed) and counted in
+     * stats().droppedMs; the sub-quantum remainder always carries. Must be an
+     * integer >= 1 when present. Default: 8.
+     */
+    maxSubSteps?: number;
+}
+
+// ---------------------------------------------------------------------------
 // Frame accessor (ReadSignal-shaped)
 // ---------------------------------------------------------------------------
 
@@ -223,6 +241,25 @@ export interface Clock {
      * @throws {LiteClockDisposedError} attachInterval on a disposed clock.
      */
     attachInterval(ms: number): void;
+    /**
+     * Attach a fixed-timestep accumulator driver. Each rAF frame accumulates
+     * real elapsed time and feeds the PUBLIC advance(stepMs) a whole number of
+     * times (the sim quantum is stepMs * timeScale). Replaces any prior attach.
+     *
+     * The maxSubSteps cap is the spiral-of-death guard: after a suspend, excess
+     * whole quanta are dropped (never fed) and counted in stats().droppedMs; the
+     * sub-quantum remainder always carries, so replay stays deterministic.
+     * droppedMs is real-time observability -- it freezes at dispose, is never
+     * reset, and is NOT part of a snapshot (a driver is not sim state).
+     *
+     * @throws {LiteClockDisposedError} attachFixed on a disposed clock.
+     * @throws {RangeError} stepMs not a finite number > 0, or maxSubSteps present
+     *                      but not an integer >= 1.
+     * @throws {TypeError} opts not an object, an unknown opts key (did-you-mean
+     *                     hint), or a non-number maxSubSteps.
+     * @throws {Error} requestAnimationFrame unavailable in this runtime.
+     */
+    attachFixed(stepMs: number, opts?: FixedOptions): void;
     /** Cancel any attached tick source. Idempotent (safe on a disposed clock). */
     detach(): void;
 
@@ -263,7 +300,7 @@ export interface Clock {
     timeScale: number;
 
     /**
-     * Counter snapshot. With `out` (any non-null object) fills the 7 fields
+     * Counter snapshot. With `out` (any non-null object) fills the 8 fields
      * in place and returns it -- the zero-allocation form. Without `out`,
      * allocates and returns a fresh object (the documented allocating
      * convenience). Read surface: stays callable after dispose -- counters
@@ -273,6 +310,49 @@ export interface Clock {
      * @throws {TypeError} `out` present but not an object.
      */
     stats(out?: Partial<ClockStats>): ClockStats;
+
+    /**
+     * Byte size of a snapshot at the CURRENT capacity: 72 + 49 * capacity. A
+     * pure read (a growable clock's growth changes it). Legal on a disposed
+     * clock.
+     */
+    snapshotSize(): number;
+    /**
+     * Capture all replay-observable sim state into `out` (a caller-owned
+     * Uint8Array of at least snapshotSize() bytes; longer is legal). Strictly
+     * zero-allocation. Returns the number of bytes written. The format is a
+     * versioned, native-endian, canary-guarded binary -- NOT a wire format
+     * (same-agent restore only). Readable on a disposed clock; illegal mid-tick.
+     *
+     * onComplete callbacks are NOT captured (functions are not serializable);
+     * see hydrate() for the refire contract.
+     *
+     * @throws {TypeError} `out` not a Uint8Array.
+     * @throws {RangeError} `out` shorter than snapshotSize().
+     * @throws {LiteClockReentrancyError} Called mid-tick (advancing).
+     */
+    snapshot(out: Uint8Array): number;
+    /**
+     * Restore sim state from a snapshot produced by the SAME agent. Guards
+     * fail closed in order: disposed -> mid-tick -> too-small-for-header ->
+     * bad magic -> bad format -> endian canary -> capacity mismatch ->
+     * too-small-for-capacity. No state is mutated until every guard passes.
+     *
+     * REFIRE CONTRACT: the live onCompleteFns table is preserved by id, so
+     * restore + re-advance REFIRES completions that fired in the rolled-back
+     * timeline. onComplete side effects must be rollback-aware or idempotent.
+     * Fidelity is exact only across windows containing no lane()/dispose()
+     * (see decisions/0004-snapshot.md, D1a). hydrate bumps no generation, so a
+     * handle minted before a same-clock snapshot stays valid after restore.
+     *
+     * @throws {TypeError} `buf` not a Uint8Array, bad magic, unsupported
+     *                     format, or endian canary mismatch.
+     * @throws {LiteClockDisposedError} hydrate on a disposed clock.
+     * @throws {LiteClockReentrancyError} Called mid-tick (advancing).
+     * @throws {RangeError} `buf` too small for the header, capacity mismatch, or
+     *                      too small for the snapshot's capacity.
+     */
+    hydrate(buf: Uint8Array): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +379,13 @@ export interface ClockStats {
     capacity: number;
     /** Current timeScale. */
     timeScale: number;
+    /**
+     * Total milliseconds of whole quanta dropped by attachFixed's spiral-of-
+     * death cap. Real-time observability, not sim state: it freezes at dispose,
+     * is never reset, and is absent from a snapshot. 0 unless attachFixed has
+     * dropped catch-up steps.
+     */
+    droppedMs: number;
 }
 
 // ---------------------------------------------------------------------------

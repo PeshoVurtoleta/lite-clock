@@ -1,4 +1,4 @@
-// @zakkster/lite-clock 1.4.0
+// @zakkster/lite-clock 1.4.1
 // Zero-GC simulation/timeline engine for @zakkster/lite-signal.
 //
 // SOA TypedArray lane pool. Deterministic advance(dt) -- the only mutation
@@ -1274,6 +1274,6 @@ function createClock(config) {
 // Exports
 // ---------------------------------------------------------------------------
 
-const VERSION = "1.4.0";
+const VERSION = "1.4.1";
 
 export {createClock, LiteClockCapacityError, LiteClockReentrancyError, LiteClockDisposedError, VERSION};

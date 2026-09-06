@@ -870,7 +870,7 @@ DONE WHEN
 ---
 package: "@zakkster/lite-clock"
 version_target: 1.4.1
-status: planned
+status: implemented (pipeline complete 2026-09-06; awaiting /release 1.4.1)
 gc_maxMajor: 0
 gc_maxPauseMs: 4
 alloc_bytes_per_op: 0

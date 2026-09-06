@@ -33,6 +33,42 @@ parallel Float64Arrays indexed by integer ID. Lane reads (`position()`, `t()`,
 TypedArrays. One write fans out to everything that cares; lanes that don't
 have active readers cost nothing.
 
+```bash
+npm install @zakkster/lite-clock
+```
+
+Peer dependency (not bundled, install it alongside):
+
+```bash
+npm install @zakkster/lite-signal
+```
+
+```js
+import { createClock } from "@zakkster/lite-clock";
+
+const clock = createClock();                       // default capacity 1024
+
+const fade = clock.lane({
+    duration: 300,
+    onComplete: () => console.log("fade done at", clock.simTime, "ms")
+});
+fade.start();
+
+// Deterministic manual drive -- no rAF, no timers. advance(dt) is the only
+// mutation entry point; feed it a fixed dt sequence and the state is exact.
+for (let i = 0; i < 20; i++) {
+    clock.advance(16.67);
+    console.log(i, fade.positionPeek().toFixed(1), fade.tPeek().toFixed(3), fade.donePeek());
+}
+
+console.log(clock.stats());                        // pool + tick + completion counters
+clock.dispose();                                   // terminal: returns the frame node to lite-signal
+```
+
+That whole loop allocates nothing after the `createClock`/`lane` setup. In a
+real app you swap the manual loop for a tick source and read lane values inside
+an `effect`:
+
 ```js
 import { effect } from "@zakkster/lite-signal";
 import { createClock } from "@zakkster/lite-clock";
@@ -58,17 +94,17 @@ hot path.
 
 - [Why this exists](#why-this-exists)
 - [What you get](#what-you-get)
-- [The case for SOA + one frame signal](#the-case-for-soa--one-frame-signal)
-- [Compile pipeline](#compile-pipeline)
-- [How a tick propagates](#how-a-tick-propagates)
+- [Inside a tick](#inside-a-tick)
 - [API reference](#api-reference)
 - [Edge cases pinned down](#edge-cases-pinned-down)
+- [Composability with the ecosystem](#composability-with-the-ecosystem)
+- [Zero-GC design notes](#zero-gc-design-notes)
 - [Benchmarks](#benchmarks)
-- [Testing strategy](#testing-strategy)
+- [Design decisions worth knowing](#design-decisions-worth-knowing)
+- [Testing](#testing)
 - [What this is not](#what-this-is-not)
 - [Ecosystem](#ecosystem)
-- [Browser and runtime support](#browser-and-runtime-support)
-- [Integration recipes](#integration-recipes)
+- [License](#license)
 
 ---
 
@@ -133,7 +169,12 @@ will build on for netcode replay.
 
 ---
 
-## The case for SOA + one frame signal
+## Inside a tick
+
+<details>
+<summary>The SOA rationale, the compile pipeline, and how one tick propagates end to end.</summary>
+
+### The case for SOA + one frame signal
 
 The naive design is one signal per lane. Each lane carries its own reactive
 node; `lane.value()` reads it; `advance()` writes them all. With N lanes,
@@ -162,9 +203,7 @@ The pattern matches `lite-room` (peer state in TypedArrays, one CRDT signal),
 `lite-rollback` (frame state in ring buffers, one tick signal), and most other
 high-scale reactive systems.
 
----
-
-## Compile pipeline
+### Compile pipeline
 
 `createClock(config)` performs all setup up front (with one 1.3.0 exception:
 the cycling-lane and drain-scratch arrays materialize lazily at first use --
@@ -215,9 +254,7 @@ After freeze, the public methods are stable references. Internal TypedArrays
 are reassigned on growth (`let` bindings, all reads through getter properties
 on the instance so live `LaneHandle` instances see the new buffers).
 
----
-
-## How a tick propagates
+### How a tick propagates
 
 ```mermaid
 sequenceDiagram
@@ -306,6 +343,8 @@ Key invariants:
     torture t0/t5 and a 1000-run rollback drill; the freeTop-omitting
     restore is torture control #6 and demonstrably diverges).
 
+</details>
+
 ---
 
 ## API reference
@@ -326,6 +365,22 @@ Exports:
 - `LiteClockCapacityError` -- thrown on pool exhaustion
 - `LiteClockReentrancyError` -- thrown on re-entrant advance during a tick
 - `LiteClockDisposedError` -- thrown by the mutation surface of a disposed clock
+
+### Contract constants
+
+These are module-level contract values -- not exports, but the fixed numbers
+the public surface is specified against (proven by `test/12-version-sync` and
+`test/18-snapshot`):
+
+| Constant | Value | Meaning |
+| -- | -- | -- |
+| `DEFAULT_CAPACITY` | `1024` | lane pool size when `capacity` is omitted |
+| `MAX_LANES` | `65534` | hard ceiling (`0xFFFE`; `0xFFFF` reserved as the Uint16 sentinel) |
+| `SNAP_FORMAT` | `1` | snapshot binary format version, validated by `hydrate` |
+| `SNAP_HEADER_BYTES` | `72` | snapshot header size (four u32 + seven f64 scalars) |
+| `SNAP_BYTES_PER_LANE` | `49` | per-lane cost across the ten SOA slabs |
+
+The exact capture size is `snapshotSize() = 72 + 49 * capacity` bytes.
 
 ### createClock
 
@@ -769,163 +824,55 @@ model -- never hits the boundary.
 
 ---
 
-## Benchmarks
+## Composability with the ecosystem
 
-Measured on Node 22.x x64, `--expose-gc`. Numbers are
-"ops per second" normalized to the smallest meaningful unit (per advance, per
-lane-tick, per alloc/dispose cycle). Retention is GC-corrected steady-state.
+The end-to-end shape lite-clock was built for: a statechart entry action starts
+a lane, an ease curve shapes its `t`, a frame effect writes the DOM, and every
+completed tick is captured into a preallocated ring slot for rollback. Every
+`snapshot` lands OUTSIDE the tick (after `advance` returns), so capture stays
+zero-allocation.
 
+```js
+import { createStatechart } from "@zakkster/lite-statechart";
+import { createClock } from "@zakkster/lite-clock";
+import { effect } from "@zakkster/lite-signal";
+import { easeOutCubic } from "@zakkster/lite-ease";
+
+const clock = createClock({ capacity: 256 });
+
+// One preallocated snapshot ring -- capture never allocates.
+const SLOT_BYTES = clock.snapshotSize();           // 72 + 49 * capacity
+const RING = 64;
+const ringBuf = new Uint8Array(SLOT_BYTES * RING);
+let head = 0;
+
+let slide;
+const machine = createStatechart({
+    initial: "idle",
+    states: {
+        idle:    { on: { GO: "sliding" } },
+        sliding: {                                 // entry action -> start a lane
+            entry: () => {
+                slide = clock.lane({ duration: 400, onComplete: () => machine.send("REST") });
+                slide.start();
+            },
+            on: { REST: "idle" }
+        }
+    }
+});
+
+effect(() => {                                     // frame-tracked DOM write
+    const eased = easeOutCubic(slide ? slide.t() : 0);   // ease -> curve the t
+    panel.style.transform = "translateX(" + (eased * 100) + "%)";
+});
+
+machine.send("GO");
+for (let f = 0; f < 300; f++) {
+    clock.advance(8);                              // one atomic 8ms tick
+    clock.snapshot(ringBuf.subarray(head * SLOT_BYTES, (head + 1) * SLOT_BYTES));  // capture (outside the tick)
+    head = (head + 1) & (RING - 1);                // power-of-2 ring index
+}
 ```
-idle-advance                                   62.66M ops/s   retained:   14.31 KB   (0.0147 B/op)
-active-lanes-1k                               353.62M ops/s   retained:       96 B   (0.0000 B/op)
-lane-reads-tracked                             14.80M ops/s   retained:   62.03 KB   (0.0635 B/op)
-alloc-dispose-churn                            17.19M ops/s   retained:      368 B   (0.0018 B/op)
-completion-fanout-100                           7.09M ops/s   retained:   16.88 KB   (0.0346 B/op)
-attach-interval-once                          105.51K ops/s   retained: -859.80 KB   (one-time setup)
-loop-cycle-100                                120.02M ops/s   retained:    3.22 KB   (0.0033 B/op)
-snapshot-1024                                   1.56M ops/s   retained:    4.84 KB   (0.0992 B/op)
-```
-
-Reading the table:
-
-- `active-lanes-1k`: ~354M *lane-ticks* per second -- a single 1ms slice
-  of simulation advancing all 1000 lanes. The hot loop is one TypedArray
-  scan + write-back per lane.
-- `lane-reads-tracked`: ~15M *frame-ticks* per second with one effect tracking
-  three reads (position + t + done). Per "op" includes signal write, effect
-  dispatch, three signal reads, three TypedArray loads.
-- `alloc-dispose-churn`: ~17M lane create/dispose cycles per second. Bound
-  by `new LaneHandle()` -- a small object allocation per lane. Pooled handles
-  are a roadmap item.
-- `loop-cycle-100`: 100 loop lanes each completing one cycle per advance --
-  the bit-exact carry recompute runs 100 times per iteration and still holds
-  ~120M lane-cycles per second.
-- `snapshot-1024`: one FULL state capture of a 1024-capacity clock (50,248
-  bytes: header + 7 scalars + 10 slabs) into a preallocated buffer, ~1.56M
-  captures per second (~0.64 us each) with zero allocation -- the per-frame
-  rollback pattern this call was built for.
-
-Run the full bench yourself:
-
-```bash
-npm run bench
-```
-
----
-
-## Testing strategy
-
-Three tiers, all run by `npm run verify`:
-
-### Tier 1 -- Behavior (unit tests, fast)
-
-`npm test` -- 187 functional tests under [`test/`](./test/) (183 run
-everywhere, 4 gc-gated):
-
-- `01-create.test.mjs` -- config validation, capacity bounds, frozen surface
-- `02-advance.test.mjs` -- dt validation, simTime accumulation, frame signal,
-  force-propagate
-- `03-lane-lifecycle.test.mjs` -- alloc, start/pause/dispose, pool reuse,
-  idempotency
-- `04-progression.test.mjs` -- position/t/done over time, tracked vs peek,
-  computed composition
-- `05-reverse.test.mjs` -- flag toggle, pre-start reverse, pause/resume
-- `06-completion.test.mjs` -- end-of-tick drain, effect-saw-done ordering,
-  throw isolation, callback re-entry
-- `07-attach.test.mjs` -- attachInterval (real timers), attachRAF (mocked),
-  detach, dispose
-- `08-capacity.test.mjs` -- throw vs grow policies, MAX_LANES boundary
-- `09-determinism.test.mjs` -- same dt sequence yields identical state
-- `11-dispose-leak.test.mjs` -- 4096 create/dispose cycles do not leak
-  lite-signal nodes
-- `12-version-sync.test.mjs` -- three-place version sync, frozen surface keys
-- `13-config-law.test.mjs` -- unknown-key rejection with did-you-mean hints
-- `14-timescale.test.mjs` / `15-seek-restart.test.mjs` /
-  `16-loop-pingpong.test.mjs` / `17-stats.test.mjs` -- the 1.3.0 timeline
-  surface, boundary-by-boundary
-- `18-snapshot.test.mjs` -- snapshot/hydrate guard ladders, round-trip
-  identity, the refire contract and its documented boundaries
-- `19-attach-fixed.test.mjs` -- fixed-step quanta, remainder carry, the
-  drop counter, opts law (mocked rAF, dyadic stepMs)
-
-### Tier 2 -- Memory (allocation-free verification)
-
-`npm run test:gc` -- 4 additional tests under `--expose-gc`:
-
-- `10-gc.test.mjs` -- 1K active lanes x 10K ticks: retention < 256 KB
-- 100K empty ticks: retention < 128 KB
-- 1M lane-read trio: retention < 128 KB
-- 100K alloc/dispose cycles: retention < 1 MB, pool returns to baseline
-
-### Tier 3 -- Performance (measured throughput)
-
-`npm run bench` -- eight scenarios with retention budget, see above.
-
----
-
-## What this is not
-
-- **Not a tween library.** No easing curves, no path interpolation, no
-  spring physics. Compose with [`@zakkster/lite-ease`][lite-ease] for
-  easing; the lane's `t()` is the input to your easing function.
-- **Not a scheduler with priorities.** All lanes advance at the clock's
-  rate. If you want priority queues / staggered scheduling, do it in
-  consumer code by gating `start()` on conditions.
-- **Not a state machine.** Lanes have only four states (alloc, active,
-  paused, done). For complex flows, compose with
-  [`@zakkster/lite-statechart`][lite-statechart] -- a state's entry action
-  can `start()` lanes, an exit action can `dispose()` them.
-- **Not async.** No promises, no microtasks, no requestIdleCallback. Every
-  call is synchronous. Async coordination belongs upstream.
-- **Not a renderer.** This library only computes lane positions. Reading
-  those into DOM/canvas/WebGL is your job.
-- **Not a wire format.** `snapshot()` produces a same-agent, canary-guarded
-  native-endian artifact for capture/rollback on the machine that made it.
-  Cross-peer or cross-machine state sync is a future `lite-room` contract.
-
----
-
-## Ecosystem
-
-`lite-clock` is part of the `@zakkster/lite-*` family:
-
-| Package | Role |
-| -- | -- |
-| [`@zakkster/lite-signal`][lite-signal] | Zero-GC reactive graph (peer dependency) |
-| [`@zakkster/lite-statechart`][lite-statechart] | Compiled finite state machines |
-| [`@zakkster/lite-ease`][lite-ease] | Zero-alloc easing functions |
-| [`@zakkster/lite-lerp`][lite-lerp] | Zero-alloc linear interpolation |
-| [`@zakkster/lite-keyframe`][lite-keyframe] | Frame-anchored animation primitives |
-| [`@zakkster/lite-room`][lite-room] | CRDT real-time collaboration |
-| [`@zakkster/lite-rollback`][lite-rollback] | Deterministic netcode rollback |
-| [`@zakkster/lite-persist`][lite-persist] | Storage adapter for signal/statechart |
-
-`lite-clock` is designed to be the timeline beneath `lite-room` (peer interpolation),
-`lite-rollback` (frame replay), and any animation work that needs to scale.
-
-[lite-signal]: https://www.npmjs.com/package/@zakkster/lite-signal
-[lite-statechart]: https://www.npmjs.com/package/@zakkster/lite-statechart
-[lite-ease]: https://www.npmjs.com/package/@zakkster/lite-ease
-[lite-lerp]: https://www.npmjs.com/package/@zakkster/lite-lerp
-[lite-keyframe]: https://www.npmjs.com/package/@zakkster/lite-keyframe
-[lite-room]: https://www.npmjs.com/package/@zakkster/lite-room
-[lite-rollback]: https://www.npmjs.com/package/@zakkster/lite-rollback
-[lite-persist]: https://www.npmjs.com/package/@zakkster/lite-persist
-
----
-
-## Browser and runtime support
-
-- **Modern browsers** (Chrome 80+, Firefox 78+, Safari 14+): full support
-- **Node**: 18+ (ESM-only)
-- **Bun, Deno**: should work; not tested
-
-The package is ESM-only with no CJS shim. `lite-signal` is a peer dependency
-that must be resolvable in your bundler/runtime.
-
----
-
-## Integration recipes
 
 ### Driving a DOM animation
 
@@ -1012,6 +959,223 @@ uiClock.attachRAF();
 const simClock = createClock();    // fixed-step physics
 simClock.attachInterval(8);        // 125 Hz
 ```
+
+---
+
+## Zero-GC design notes
+
+<details>
+<summary>What allocates, what never does, and the budgets the torture suite gates.</summary>
+
+`lite-clock` splits its surface into a cold setup path (allocates once) and a
+hot per-frame path (allocates nothing). The per-frame side -- `advance`, every
+read, `snapshot(out)`, `stats(out)` -- holds a hard zero-allocation budget.
+
+| Call | Allocates? | What |
+| -- | -- | -- |
+| `createClock(config)` | yes (once) | the SOA slabs + frozen instance |
+| `clock.lane(opts)` | yes | one small `LaneHandle` object per lane |
+| `clock.stats()` | yes | a fresh `ClockStats` object (no-arg convenience form) |
+| `clock.hydrate(buf)` | yes (~10) | short-lived subarray views on the restore path -- minor-GC fodder only |
+| `clock.advance(dt)` / `advanceTo(t)` | no | in-place active-list scan + one signal write |
+| `lane.position/t/done` (+ peeks) | no | one TypedArray load + branch |
+| `clock.snapshot(out)` | no | memcpy through cached byte views into the caller's buffer |
+| `clock.stats(out)` | no | fills the caller's sink in place |
+| `lane.seek/restart`, `clock.timeScale`, `clock.detach` | no | flag/scalar writes only |
+
+The ONLY non-init allocation on the replay path is `hydrate`'s ~10 short-lived
+subarray views (see `llms.txt`); the per-frame side -- capture via
+`snapshot(out)` -- allocates nothing.
+
+The budgets, enforced by `node --expose-gc test/torture.mjs`
+(`@zakkster/lite-leak` + `@zakkster/lite-gc-profiler`):
+
+- `maxMajor: 0` -- zero major GCs across the hot window
+- `maxPauseMs: 4` -- no GC pause over 4 ms
+- `0 B/op` -- steady-state allocation per advance is zero
+- `4096` create/dispose leak cycles return the leak tracker to size 0
+
+See the torture tiers under [Testing](#testing).
+
+</details>
+
+---
+
+## Benchmarks
+
+Every number below is one `npm run bench` run on the release commit, quoted
+verbatim -- the first line is the provenance stamp the harness prints (package
+version, node version, platform-arch). Numbers are "ops per second" normalized
+to the smallest meaningful unit (per advance, per lane-tick, per alloc/dispose
+cycle). Retention is GC-corrected steady-state.
+
+```
+@zakkster/lite-clock 1.4.1 | node v26.3.1 | darwin-arm64 | bench (--expose-gc)
+
+  idle-advance                                   62.51M ops/s   retained:   14.51 KB   (0.0149 B/op)
+  active-lanes-1k                               370.15M ops/s   retained:      144 B   (0.0000 B/op)
+  lane-reads-tracked                             13.59M ops/s   retained:   60.08 KB   (0.0615 B/op)
+  alloc-dispose-churn                            18.03M ops/s   retained:      608 B   (0.0030 B/op)
+  completion-fanout-100                           7.38M ops/s   retained:   17.60 KB   (0.0360 B/op)
+  attach-interval-once                          108.76K ops/s   retained: -903.35 KB   (-92.5032 B/op)
+  loop-cycle-100                                122.73M ops/s   retained:    3.22 KB   (0.0033 B/op)
+  snapshot-1024                                   1.65M ops/s   retained:    4.84 KB   (0.0992 B/op)
+```
+
+Reading the table:
+
+- `active-lanes-1k`: ~370M *lane-ticks* per second -- a single 1ms slice
+  of simulation advancing all 1000 lanes. The hot loop is one TypedArray
+  scan + write-back per lane.
+- `lane-reads-tracked`: ~14M *frame-ticks* per second with one effect tracking
+  three reads (position + t + done). Per "op" includes signal write, effect
+  dispatch, three signal reads, three TypedArray loads.
+- `alloc-dispose-churn`: ~18M lane create/dispose cycles per second. Bound
+  by `new LaneHandle()` -- a small object allocation per lane. Pooled handles
+  are a roadmap item.
+- `loop-cycle-100`: 100 loop lanes each completing one cycle per advance --
+  the bit-exact carry recompute runs 100 times per iteration and still holds
+  ~123M lane-cycles per second.
+- `snapshot-1024`: one FULL state capture of a 1024-capacity clock (50,248
+  bytes: header + 7 scalars + 10 slabs) into a preallocated buffer, ~1.65M
+  captures per second (~0.61 us each) with zero allocation -- the per-frame
+  rollback pattern this call was built for.
+
+Run the full bench yourself:
+
+```bash
+npm run bench
+```
+
+---
+
+## Design decisions worth knowing
+
+Four decisions carry the load-bearing weight of the design; each has a record:
+
+- [`decisions/0001-reentrancy.md`](./decisions/0001-reentrancy.md) -- the tick
+  is atomic: a re-entrant `advance()`/`advanceTo()` during propagation throws
+  `LiteClockReentrancyError` rather than corrupting a half-done tick.
+- [`decisions/0002-handle-lifecycle.md`](./decisions/0002-handle-lifecycle.md)
+  -- a `Uint32` generation tag per slot makes a stale `Lane` handle ABA-proof,
+  so a LIFO-reused slot is never driven by a handle to its former tenant.
+- [`decisions/0003-seek.md`](./decisions/0003-seek.md) -- `seek(p)` is an
+  authored edit, not time: it never starts a lane, never fires `onComplete`,
+  never sets DONE, and never ticks the frame signal.
+- [`decisions/0004-snapshot.md`](./decisions/0004-snapshot.md) -- the snapshot
+  is a same-agent, native-endian, canary-guarded capture artifact, NOT a wire
+  format; `snapshot(out)` is zero-allocation, `hydrate` refires rolled-back
+  completions.
+
+---
+
+## Testing
+
+Three tiers, all run by `npm run verify`:
+
+### Tier 1 -- Behavior (unit tests, fast)
+
+`npm test` -- 193 functional tests under [`test/`](./test/) (189 run
+everywhere, 4 gc-gated):
+
+- `01-create.test.mjs` -- config validation, capacity bounds, frozen surface
+- `02-advance.test.mjs` -- dt validation, simTime accumulation, frame signal,
+  force-propagate
+- `03-lane-lifecycle.test.mjs` -- alloc, start/pause/dispose, pool reuse,
+  idempotency
+- `04-progression.test.mjs` -- position/t/done over time, tracked vs peek,
+  computed composition
+- `05-reverse.test.mjs` -- flag toggle, pre-start reverse, pause/resume
+- `06-completion.test.mjs` -- end-of-tick drain, effect-saw-done ordering,
+  throw isolation, callback re-entry
+- `07-attach.test.mjs` -- attachInterval (real timers), attachRAF (mocked),
+  detach, dispose
+- `08-capacity.test.mjs` -- throw vs grow policies, MAX_LANES boundary
+- `09-determinism.test.mjs` -- same dt sequence yields identical state
+- `11-dispose-leak.test.mjs` -- 4096 create/dispose cycles do not leak
+  lite-signal nodes
+- `12-version-sync.test.mjs` -- three-place version sync, frozen surface keys
+- `13-config-law.test.mjs` -- unknown-key rejection with did-you-mean hints
+- `14-timescale.test.mjs` / `15-seek-restart.test.mjs` /
+  `16-loop-pingpong.test.mjs` / `17-stats.test.mjs` -- the 1.3.0 timeline
+  surface, boundary-by-boundary
+- `18-snapshot.test.mjs` -- snapshot/hydrate guard ladders, round-trip
+  identity, the refire contract and its documented boundaries
+- `19-attach-fixed.test.mjs` -- fixed-step quanta, remainder carry, the
+  drop counter, opts law (mocked rAF, dyadic stepMs)
+
+### Tier 2 -- Memory (allocation-free verification)
+
+`npm run test:gc` -- 4 additional tests under `--expose-gc`:
+
+- `10-gc.test.mjs` -- 1K active lanes x 10K ticks: retention < 256 KB
+- 100K empty ticks: retention < 128 KB
+- 1M lane-read trio: retention < 128 KB
+- 100K alloc/dispose cycles: retention < 1 MB, pool returns to baseline
+
+### Tier 3 -- Performance (measured throughput)
+
+`npm run bench` -- eight scenarios with retention budget, see above.
+
+### Runtime support
+
+- **Modern browsers** (Chrome 80+, Firefox 78+, Safari 14+): full support
+- **Node**: 18+ (ESM-only)
+- **Bun, Deno**: should work; not tested
+
+The package is ESM-only with no CJS shim. `lite-signal` is a peer dependency
+that must be resolvable in your bundler/runtime.
+
+---
+
+## What this is not
+
+- **Not a tween library.** No easing curves, no path interpolation, no
+  spring physics. Compose with [`@zakkster/lite-ease`][lite-ease] for
+  easing; the lane's `t()` is the input to your easing function.
+- **Not a scheduler with priorities.** All lanes advance at the clock's
+  rate. If you want priority queues / staggered scheduling, do it in
+  consumer code by gating `start()` on conditions.
+- **Not a state machine.** Lanes have only four states (alloc, active,
+  paused, done). For complex flows, compose with
+  [`@zakkster/lite-statechart`][lite-statechart] -- a state's entry action
+  can `start()` lanes, an exit action can `dispose()` them.
+- **Not async.** No promises, no microtasks, no requestIdleCallback. Every
+  call is synchronous. Async coordination belongs upstream.
+- **Not a renderer.** This library only computes lane positions. Reading
+  those into DOM/canvas/WebGL is your job.
+- **Not a wire format.** `snapshot()` produces a same-agent, canary-guarded
+  native-endian artifact for capture/rollback on the machine that made it.
+  Cross-peer or cross-machine state sync is a future `lite-room` contract.
+
+---
+
+## Ecosystem
+
+`lite-clock` is part of the `@zakkster/lite-*` family:
+
+| Package | Role |
+| -- | -- |
+| [`@zakkster/lite-signal`][lite-signal] | Zero-GC reactive graph (peer dependency) |
+| [`@zakkster/lite-statechart`][lite-statechart] | Compiled finite state machines |
+| [`@zakkster/lite-ease`][lite-ease] | Zero-alloc easing functions |
+| [`@zakkster/lite-lerp`][lite-lerp] | Zero-alloc linear interpolation |
+| [`@zakkster/lite-keyframe`][lite-keyframe] | Frame-anchored animation primitives |
+| [`@zakkster/lite-room`][lite-room] | CRDT real-time collaboration |
+| [`@zakkster/lite-rollback`][lite-rollback] | Deterministic netcode rollback |
+| [`@zakkster/lite-persist`][lite-persist] | Storage adapter for signal/statechart |
+
+`lite-clock` is designed to be the timeline beneath `lite-room` (peer interpolation),
+`lite-rollback` (frame replay), and any animation work that needs to scale.
+
+[lite-signal]: https://www.npmjs.com/package/@zakkster/lite-signal
+[lite-statechart]: https://www.npmjs.com/package/@zakkster/lite-statechart
+[lite-ease]: https://www.npmjs.com/package/@zakkster/lite-ease
+[lite-lerp]: https://www.npmjs.com/package/@zakkster/lite-lerp
+[lite-keyframe]: https://www.npmjs.com/package/@zakkster/lite-keyframe
+[lite-room]: https://www.npmjs.com/package/@zakkster/lite-room
+[lite-rollback]: https://www.npmjs.com/package/@zakkster/lite-rollback
+[lite-persist]: https://www.npmjs.com/package/@zakkster/lite-persist
 
 ---
 

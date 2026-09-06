@@ -1,6 +1,6 @@
 # @zakkster/lite-clock
 
-Version: 1.4.0
+Version: 1.4.1
 
 Zero-GC simulation/timeline engine for @zakkster/lite-signal. SOA TypedArray
 lane pool. Deterministic `advance(dt)` -- the only mutation entry point.
@@ -475,8 +475,8 @@ bit-exactly -- see the round-trip law above.
 
 - `Clock.js` -- implementation (~1250 lines, ESM)
 - `Clock.d.ts` -- TypeScript declarations
-- `test/01..19` -- behavior, GC, dispose-leak, snapshot, and fixed-step
-  regression suites
+- `test/01..20` -- behavior, GC, dispose-leak, snapshot, fixed-step, and
+  docs-drift regression suites
 - `test/torture.mjs` -- the authoritative memory + determinism gate
   (`node --expose-gc test/torture.mjs`; @zakkster/lite-leak +
   @zakkster/lite-gc-profiler; prints "ok" on success)

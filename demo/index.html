@@ -47,7 +47,7 @@
             font-family: "SF Mono", "Menlo", "Consolas", "Liberation Mono", monospace;
             font-size: 0.8125rem;
             line-height: 1.5;
-            min-height: 100 dvh;
+            min-height: 100dvh;
             background-image: linear-gradient(var(--grid-line) 1px, transparent 1px),
             linear-gradient(90deg, var(--grid-line) 1px, transparent 1px);
             background-size: 1.5rem 1.5rem;
@@ -260,6 +260,44 @@
 
         button.dispatch:not([disabled]):active {
             background: oklch(85% 0.28 145 / 0.16);
+        }
+
+        .slider-row {
+            display: flex;
+            flex-direction: column;
+            gap: var(--r-1);
+            margin-top: var(--r-3);
+            font-size: 0.625rem;
+            color: var(--fg-dim);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+        }
+
+        .slider-row .slider-head {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+
+        .slider-row .slider-val {
+            color: var(--fg-bright);
+            font-weight: 600;
+        }
+
+        .slider-row input[type="range"] {
+            width: 100%;
+            accent-color: #00ff41;
+            accent-color: var(--fg);
+            cursor: pointer;
+        }
+
+        .ctl-note {
+            color: var(--fg-dim);
+            font-size: 0.625rem;
+            margin-top: var(--r-2);
+            line-height: 1.5;
+            text-transform: none;
+            letter-spacing: 0;
         }
 
         .readout {
@@ -623,8 +661,8 @@
 
 <header>
     <h1>@zakkster/lite-clock -- oscilloscope demo</h1>
-    <p class="tagline">four scenes against the real engine -- multi-lane timeline, deterministic stepping, lifecycle,
-        1K-lane stress</p>
+    <p class="tagline">five scenes against the real engine -- multi-lane timeline, deterministic stepping, lifecycle,
+        1K-lane stress, snapshot / rollback</p>
 </header>
 
 <nav id="tabs">
@@ -632,6 +670,7 @@
     <button data-scene="determinism" type="button">[2] deterministic stepping</button>
     <button data-scene="lifecycle" type="button">[3] lane lifecycle</button>
     <button data-scene="stress" type="button">[4] 1K-lane stress</button>
+    <button data-scene="rollback" type="button">[5] snapshot / rollback</button>
 </nav>
 
 <main>
@@ -652,9 +691,18 @@
             <div class="panel" data-label="controls">
                 <div class="controls">
                     <button class="dispatch accent" type="button" id="tl-play">PLAY (rAF)</button>
+                    <button class="dispatch accent" type="button" id="tl-play-fixed">PLAY (fixed 8ms)</button>
                     <button class="dispatch warn" type="button" id="tl-pause">PAUSE</button>
                     <button class="dispatch" type="button" id="tl-step">STEP (advance 16.67ms)</button>
                     <button class="dispatch" type="button" id="tl-restart-all">RESTART ALL LANES</button>
+                </div>
+
+                <div class="slider-row">
+                    <div class="slider-head">
+                        <span>timeScale</span>
+                        <span class="slider-val" id="tl-scale-val">1.0x</span>
+                    </div>
+                    <input type="range" id="tl-scale" min="0" max="4" step="0.1" value="1" aria-label="timeScale">
                 </div>
 
                 <dl class="readout">
@@ -763,8 +811,19 @@
                     <button class="dispatch accent" type="button" id="lc-start">START</button>
                     <button class="dispatch warn" type="button" id="lc-pause">PAUSE</button>
                     <button class="dispatch" type="button" id="lc-reverse">REVERSE</button>
+                    <button class="dispatch accent" type="button" id="lc-restart">RESTART (seek 0 + start)</button>
                     <button class="dispatch error" type="button" id="lc-dispose">DISPOSE</button>
                     <button class="dispatch" type="button" id="lc-fresh">FRESH LANE (4s)</button>
+                </div>
+
+                <div class="slider-row">
+                    <div class="slider-head">
+                        <span>seek (ms)</span>
+                        <span class="slider-val" id="lc-seek-val">0</span>
+                    </div>
+                    <input type="range" id="lc-seek" min="0" max="4000" step="10" value="0" aria-label="seek position">
+                    <p class="ctl-note">seek() jumps position without starting the lane -- a paused
+                        or DONE lane stays stopped at the new position until START.</p>
                 </div>
             </div>
         </div>
@@ -805,6 +864,14 @@
                     <div class="value" id="stress-completed">0</div>
                 </div>
                 <div class="stress-tile">
+                    <div class="label">dropped (attachFixed cap)</div>
+                    <div class="value" id="stress-dropped">0.0 ms</div>
+                </div>
+                <div class="stress-tile">
+                    <div class="label">driver</div>
+                    <div class="value" id="stress-driver">rAF</div>
+                </div>
+                <div class="stress-tile">
                     <div class="label">heap delta</div>
                     <div class="value" id="stress-heap">--</div>
                 </div>
@@ -815,17 +882,79 @@
                 <button id="stress-stop" class="stop" type="button" disabled>STOP</button>
             </div>
 
+            <div class="toggle-row">
+                <button id="stress-drv-raf" class="start" type="button">DRIVER: rAF</button>
+                <button id="stress-drv-fixed" type="button">DRIVER: fixed 4ms (maxSubSteps 4)</button>
+            </div>
+
             <p class="stress-note">
-                The stress harness spawns 1000 lanes with random durations [200ms, 4000ms], drives the clock from rAF,
-                and recycles completed lanes via <code>onComplete</code> so the active count stays steady. Each frame:
-                lane scan + activeList compaction + one frame signal write. Telemetry sampling uses a <code>Float64Array(512)</code>
-                ring buffer (256 paired entries, power-of-2 bitmask <code>& 511</code>), and SVG histogram updates
-                throttle to every 8 frames via <code>(frame &amp; 7) === 0</code>.
+                The stress harness spawns 1000 lanes with random durations [200ms, 4000ms] and recycles completed
+                lanes each frame by polling <code>donePeek()</code> so the active count stays steady (callback-less
+                completions still count in <code>stats().totalCompletions</code>). Switch the driver to
+                <code>attachFixed(4, { maxSubSteps: 4 })</code> to cap catch-up: excess whole quanta after a stall
+                are dropped and counted in <code>stats().droppedMs</code>. Each frame: lane scan + activeList
+                compaction + one frame signal write. Telemetry reads ONE zero-alloc <code>stats(statsSink)</code>
+                fill into a module-init sink; sampling uses a <code>Float64Array(512)</code> ring buffer (256 paired
+                entries, power-of-2 bitmask <code>&amp; 511</code>), and text + SVG histogram updates throttle to
+                every 8 frames via <code>(frame &amp; 7) === 0</code>.
             </p>
         </div>
 
         <div class="panel histogram" data-label="t-distribution across 1000 lanes (50 buckets)">
             <svg id="svg-histogram" viewBox="0 0 700 180" aria-label="t-distribution histogram"></svg>
+        </div>
+    </section>
+
+    <!-- ============================ SCENE 5: ROLLBACK =========================== -->
+    <section id="scene-rollback" class="scene">
+        <div class="scene-header">
+            <h2>scene 05 -- snapshot / rollback</h2>
+            <p class="scene-blurb">capture ALL replay-observable sim state into ONE preallocated buffer, then
+                hydrate it back. the lanes jump and completions REFIRE from the rolled-back window -- the keystone
+                for time-travel debugging and netcode reconciliation.</p>
+        </div>
+
+        <div class="layout">
+            <div class="panel viz-panel" data-label="rollback lanes">
+                <svg id="svg-rollback" viewBox="0 0 700 216" aria-label="rollback lanes"></svg>
+            </div>
+
+            <div class="panel" data-label="controls">
+                <div class="controls">
+                    <button class="dispatch accent" type="button" id="rb-play">PLAY (fixed 8ms)</button>
+                    <button class="dispatch warn" type="button" id="rb-pause">PAUSE</button>
+                    <button class="dispatch" type="button" id="rb-capture" disabled>CAPTURE (snapshot -&gt; buffer)</button>
+                    <button class="dispatch accent" type="button" id="rb-rollback" disabled>ROLLBACK (hydrate)</button>
+                    <button class="dispatch" type="button" id="rb-bench">BENCH SNAPSHOT (200 lanes)</button>
+                </div>
+
+                <dl class="readout">
+                    <dt>snapshot size</dt>
+                    <dd id="rb-size">-- B</dd>
+                    <dt>last capture</dt>
+                    <dd id="rb-captime">-- us</dd>
+                    <dt>droppedMs</dt>
+                    <dd id="rb-dropped">0.0 ms</dd>
+                    <dt>simTime</dt>
+                    <dd id="rb-sim">0.00 ms</dd>
+                    <dt>bench mean</dt>
+                    <dd id="rb-bench-mean">-- us/op</dd>
+                    <dt>bench throughput</dt>
+                    <dd id="rb-bench-ops">-- ops/s</dd>
+                </dl>
+
+                <p class="ctl-note">CAPTURE and ROLLBACK unlock once the driver has run. lanes 2 (loop) and 3
+                    (pingPong) never dispose, so hydrate refires their onComplete from the rolled-back window --
+                    watch the cycle counters repeat.</p>
+            </div>
+        </div>
+
+        <div class="panel" data-label="capture / rollback log">
+            <div class="log-header">
+                <h3>snapshot events + refires</h3>
+                <button type="button" data-clear="rollback">clear</button>
+            </div>
+            <div class="log" id="log-rollback"></div>
         </div>
     </section>
 
@@ -865,6 +994,9 @@
     const LOG_MAX_ROWS = 200;
     const TIMELINE_LANE_COUNT = 6;
     const TIMELINE_DURATIONS = [800, 1200, 1600, 2000, 2400, 3000];
+    // Shared ~10Hz telemetry throttle mask ((frame & MASK) === 0). Text writes
+    // (toFixed/textContent) live behind this; geometry stays per-frame.
+    const TEXT_UPDATE_MASK = 7;
 
     // ===========================================================================
     // Cached DOM references
@@ -875,13 +1007,17 @@
     const $logTimeline = document.getElementById("log-timeline");
     const $logDeterminism = document.getElementById("log-determinism");
     const $logLifecycle = document.getElementById("log-lifecycle");
+    const $logRollback = document.getElementById("log-rollback");
 
     // Timeline
     const $svgTimeline = document.getElementById("svg-timeline");
     const $tlPlay = document.getElementById("tl-play");
+    const $tlPlayFixed = document.getElementById("tl-play-fixed");
     const $tlPause = document.getElementById("tl-pause");
     const $tlStep = document.getElementById("tl-step");
     const $tlRestart = document.getElementById("tl-restart-all");
+    const $tlScale = document.getElementById("tl-scale");
+    const $tlScaleVal = document.getElementById("tl-scale-val");
     const $tlSim = document.getElementById("tl-sim");
     const $tlTicks = document.getElementById("tl-ticks");
     const $tlActive = document.getElementById("tl-active");
@@ -906,8 +1042,11 @@
     const $lcStart = document.getElementById("lc-start");
     const $lcPause = document.getElementById("lc-pause");
     const $lcReverse = document.getElementById("lc-reverse");
+    const $lcRestart = document.getElementById("lc-restart");
     const $lcDispose = document.getElementById("lc-dispose");
     const $lcFresh = document.getElementById("lc-fresh");
+    const $lcSeek = document.getElementById("lc-seek");
+    const $lcSeekVal = document.getElementById("lc-seek-val");
     const $lcSim = document.getElementById("lc-sim");
     const $lcPos = document.getElementById("lc-pos");
     const $lcT = document.getElementById("lc-t");
@@ -923,14 +1062,19 @@
     const $stressActive = document.getElementById("stress-active");
     const $stressTicks = document.getElementById("stress-ticks");
     const $stressCompd = document.getElementById("stress-completed");
+    const $stressDropped = document.getElementById("stress-dropped");
+    const $stressDrv = document.getElementById("stress-driver");
     const $stressHeap = document.getElementById("stress-heap");
     const $stressStart = document.getElementById("stress-start");
     const $stressStop = document.getElementById("stress-stop");
+    const $stressDrvRaf = document.getElementById("stress-drv-raf");
+    const $stressDrvFixed = document.getElementById("stress-drv-fixed");
 
     const LOG_BY_NAME = {
         timeline: $logTimeline,
         determinism: $logDeterminism,
-        lifecycle: $logLifecycle
+        lifecycle: $logLifecycle,
+        rollback: $logRollback
     };
 
     // ===========================================================================
@@ -989,12 +1133,16 @@
     const tlRowGroups = new Array(TIMELINE_LANE_COUNT);
     const tlFillRects = new Array(TIMELINE_LANE_COUNT);
     const tlLabels = new Array(TIMELINE_LANE_COUNT);
+    const tlCycles = new Array(TIMELINE_LANE_COUNT);   // wrap counters for loop/pingPong lanes
+    let tlFrame = 0;                                   // effect frame counter for the text mask
 
     // Build the SVG once at init.
     const TL_BAR_X = 100;
     const TL_BAR_W = 540;
     const TL_ROW_H = 48;
     const TL_ROW_Y0 = 24;
+    const TL_LOOP_IDX = 4;       // this lane runs as { loop: true }
+    const TL_PINGPONG_IDX = 5;   // this lane runs as { pingPong: true }
 
     function buildTimelineSvg() {
         for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
@@ -1007,7 +1155,8 @@
             lbl.setAttribute("x", 12);
             lbl.setAttribute("y", y + 12);
             lbl.setAttribute("class", "lane-label");
-            lbl.textContent = "lane " + i + " (" + TIMELINE_DURATIONS[i] + "ms)";
+            const kind = i === TL_LOOP_IDX ? " loop" : i === TL_PINGPONG_IDX ? " pingPong" : "";
+            lbl.textContent = "lane " + i + " (" + TIMELINE_DURATIONS[i] + "ms)" + kind;
             g.appendChild(lbl);
 
             const bg = document.createElementNS(SVG_NS, "rect");
@@ -1045,24 +1194,43 @@
     function tlSpawnLane(i) {
         const dur = TIMELINE_DURATIONS[i];
         const idx = i;  // closure captures index only
-        const lane = tlClock.lane({
+        // Lanes 4 and 5 are loop / pingPong: they NEVER report done, so their
+        // onComplete (one fire per wrap) logs the cycle count -- it must never
+        // dispose/respawn a loop lane from its own onComplete.
+        if (idx === TL_LOOP_IDX || idx === TL_PINGPONG_IDX) {
+            const isPing = idx === TL_PINGPONG_IDX;
+            return tlClock.lane({
+                duration: dur,
+                loop: !isPing,
+                pingPong: isPing,
+                onComplete: () => {
+                    tlCycles[idx] = (tlCycles[idx] + 1) | 0;
+                    appendLog($logTimeline,
+                        '<span class="ts">' + ts() + '</span> lane <span class="hl">' + idx + '</span> ' + (isPing ? "pingPong" : "loop") + ' cycle <span class="hl">' + tlCycles[idx] + '</span>',
+                        "info");
+                }
+            });
+        }
+        // One-shot lanes: log completion, then auto-respawn so the scene runs on.
+        return tlClock.lane({
             duration: dur,
             onComplete: () => {
                 appendLog($logTimeline,
                     '<span class="ts">' + ts() + '</span> lane <span class="hl">' + idx + '</span> completed at simTime=' + tlClock.simTime.toFixed(2),
                     "done");
-                // Auto-respawn so the scene keeps running.
                 tlLanes[idx].dispose();
                 tlLanes[idx] = tlSpawnLane(idx);
                 tlLanes[idx].start();
             }
         });
-        return lane;
     }
 
+    // First build only. RESTART ALL re-uses lane.restart() (the 1.3.0 API that
+    // replaced the dispose/realloc replay pattern), never a rebuild.
     function tlInit() {
         for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
             if (tlLanes[i] !== undefined) tlLanes[i].dispose();
+            tlCycles[i] = 0;
             tlLanes[i] = tlSpawnLane(i);
             tlLanes[i].start();
         }
@@ -1071,29 +1239,43 @@
     tlInit();
 
     // One effect drives ALL lanes' visuals via the tracked frame signal.
+    // Geometry (bar width, row-state class) updates every frame; all text
+    // (toFixed metas + readouts) is throttled to ~10Hz via the frame mask.
     effect(() => {
         tlClock.frame();   // track
+        tlFrame = (tlFrame + 1) | 0;
+        const textTick = (tlFrame & TEXT_UPDATE_MASK) === 0;
         for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
             const ln = tlLanes[i];
             const t = ln.tPeek();
             tlFillRects[i].setAttribute("width", (t * TL_BAR_W) | 0);
-            tlLabels[i].textContent = "t=" + t.toFixed(3);
-            // Toggle row state class
+            // Toggle row state class (geometry-adjacent, per frame)
             const grp = tlRowGroups[i];
             if (ln.donePeek()) {
                 if (grp.className.baseVal !== "lane-row done") grp.setAttribute("class", "lane-row done");
             } else {
                 if (grp.className.baseVal !== "lane-row") grp.setAttribute("class", "lane-row");
             }
+            if (textTick) tlLabels[i].textContent = "t=" + t.toFixed(3);
         }
-        $tlSim.textContent = tlClock.simTime.toFixed(2) + " ms";
-        $tlTicks.textContent = String(tlClock.ticks);
-        $tlActive.textContent = String(tlClock.activeCount);
+        if (textTick) {
+            $tlSim.textContent = tlClock.simTime.toFixed(2) + " ms";
+            $tlTicks.textContent = String(tlClock.ticks);
+            $tlActive.textContent = String(tlClock.activeCount);
+        }
     });
+
+    // Reflect the live timeScale into the readout at init (never hardcode state).
+    $tlScale.value = String(tlClock.timeScale);
+    $tlScaleVal.textContent = tlClock.timeScale === 0 ? "FREEZE" : tlClock.timeScale.toFixed(1) + "x";
 
     $tlPlay.addEventListener("click", () => {
         tlClock.attachRAF();
         $tlSrc.textContent = "requestAnimationFrame";
+    });
+    $tlPlayFixed.addEventListener("click", () => {
+        tlClock.attachFixed(8);
+        $tlSrc.textContent = "fixed 8ms";
     });
     $tlPause.addEventListener("click", () => {
         tlClock.detach();
@@ -1104,9 +1286,21 @@
         $tlSrc.textContent = "manual";
         tlClock.advance(16.67);
     });
+    // Cold path (input handler): toFixed is fine here. timeScale 0 = FREEZE
+    // (advance still ticks + propagates, but no lane completes).
+    $tlScale.addEventListener("input", () => {
+        const v = +$tlScale.value;
+        tlClock.timeScale = v;
+        $tlScaleVal.textContent = v === 0 ? "FREEZE" : v.toFixed(1) + "x";
+    });
+    // RESTART ALL uses lane.restart() (seek(0)+start) on every lane, one-shot
+    // and loop/pingPong alike -- no dispose/respawn.
     $tlRestart.addEventListener("click", () => {
-        tlInit();
-        appendLog($logTimeline, '<span class="ts">' + ts() + '</span> restarted all 6 lanes', "info");
+        for (let i = 0; i < TIMELINE_LANE_COUNT; i = (i + 1) | 0) {
+            tlCycles[i] = 0;
+            tlLanes[i].restart();
+        }
+        appendLog($logTimeline, '<span class="ts">' + ts() + '</span> restart() all 6 lanes', "info");
     });
 
     // ===========================================================================
@@ -1254,19 +1448,27 @@
     // (otherwise the first run hits the temporal dead zone and throws).
     let lcActive = false;
     let lcReversed = false;
+    let lcFrame = 0;   // effect frame counter for the text mask
 
-    // Render via effect that tracks the frame signal
+    // Render via effect that tracks the frame signal. Geometry (fill width,
+    // state classes) updates every frame via integer math; all text readouts
+    // (toFixed) are throttled to ~10Hz via the frame mask.
     effect(() => {
         lcClock.frame();
         if (lcLane === null) return;
+        lcFrame = (lcFrame + 1) | 0;
+        const textTick = (lcFrame & TEXT_UPDATE_MASK) === 0;
         const pos = lcLane.positionPeek();
         const t = lcLane.tPeek();
         const done = lcLane.donePeek();
-        $lcFill.style.setProperty("width", (t * 100).toFixed(2) + "%");
-        $lcSim.textContent = lcClock.simTime.toFixed(2) + " ms";
-        $lcPos.textContent = pos.toFixed(2);
-        $lcT.textContent = t.toFixed(4);
-        $lcDone.textContent = String(done);
+        // Per-frame width: integer percent (no toFixed on the hot path).
+        $lcFill.style.setProperty("width", ((t * 10000) | 0) / 100 + "%");
+        if (textTick) {
+            $lcSim.textContent = lcClock.simTime.toFixed(2) + " ms";
+            $lcPos.textContent = pos.toFixed(2);
+            $lcT.textContent = t.toFixed(4);
+            $lcDone.textContent = String(done);
+        }
 
         // We don't have direct access to the FLAG_* bits from the public API; infer them.
         // ALLOC: lane exists (handle was returned and not yet observed to be invalid)
@@ -1297,6 +1499,19 @@
         lcReversed = !lcReversed;
         appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> reverse() -> reversed=' + lcReversed);
     });
+    $lcRestart.addEventListener("click", () => {
+        lcLane.restart();   // seek(0) + start -- clears DONE, runs from zero
+        lcActive = true;
+        $lcSeek.value = "0";
+        $lcSeekVal.textContent = "0";
+        appendLog($logLifecycle, '<span class="ts">' + ts() + '</span> restart() -> seek(0) + start()');
+    });
+    // Cold path (input handler): seek jumps position; it never starts the lane.
+    $lcSeek.addEventListener("input", () => {
+        const ms = +$lcSeek.value;
+        lcLane.seek(ms);
+        $lcSeekVal.textContent = String(ms);
+    });
     $lcDispose.addEventListener("click", () => {
         lcLane.dispose();
         lcActive = false;
@@ -1316,8 +1531,14 @@
     // ===========================================================================
     const stressClock = createClock({capacity: 1024});
     const stressLanes = new Array(STRESS_LANE_COUNT);
+    // Preallocated stats sink -- filled once per masked frame by stats(statsSink),
+    // a strictly zero-allocation read (see llms.txt stats(out) contract).
+    const statsSink = {
+        poolUsed: 0, poolFree: 0, peakActive: 0, totalTicks: 0,
+        totalCompletions: 0, capacity: 0, timeScale: 0, droppedMs: 0
+    };
     let stressRunning = false;
-    let stressCompleted = 0;
+    let stressDriver = "raf";   // "raf" | "fixed"
 
     const stressHistory = new Float64Array(STRESS_HISTORY_LEN);
     let stressHead = 0;
@@ -1378,16 +1599,11 @@
 
     buildHistogramSvg();
 
-    // Pre-bound onComplete so each lane uses the same function reference (no
-    // per-lane closure allocation).
-    function onStressLaneComplete() {
-        stressCompleted = (stressCompleted + 1) | 0;
-    }
-
     function stressSpawnLane(i) {
-        // Random duration in [200, 4000]
+        // Random duration in [200, 4000]. Callback-less: completions are counted
+        // by the engine in stats().totalCompletions (no per-lane closure).
         const dur = 200 + (Math.random() * 3800);
-        const lane = stressClock.lane({duration: dur, onComplete: onStressLaneComplete});
+        const lane = stressClock.lane({duration: dur});
         lane.start();
         stressLanes[i] = lane;
     }
@@ -1468,10 +1684,13 @@
         stressFrame = (stressFrame + 1) | 0;
 
         if ((stressFrame & STRESS_TEXT_UPDATE_MASK) === 0) {
+            // ONE zero-alloc stats fill into the module-init sink; read from it.
+            stressClock.stats(statsSink);
             $stressRate.textContent = stressRateSum.toLocaleString();
             $stressActive.textContent = String(stressClock.activeCount);
-            $stressTicks.textContent = stressClock.ticks.toLocaleString();
-            $stressCompd.textContent = stressCompleted.toLocaleString();
+            $stressTicks.textContent = statsSink.totalTicks.toLocaleString();
+            $stressCompd.textContent = statsSink.totalCompletions.toLocaleString();
+            $stressDropped.textContent = statsSink.droppedMs.toFixed(1) + " ms";
             if (stressHasMemoryApi) {
                 const delta = performance.memory.usedJSHeapSize - stressHeapStart;
                 $stressHeap.textContent = fmtBytes(delta);
@@ -1482,11 +1701,25 @@
         requestAnimationFrame(stressTick);
     }
 
+    // Attach the selected driver. rAF scales dt by wall time; attachFixed(4)
+    // steps in exact 4ms quanta and, capped at maxSubSteps 4, DROPS excess
+    // catch-up quanta after a stall -- droppedMs then climbs under load.
+    function applyStressDriver() {
+        if (!stressRunning) return;
+        if (stressDriver === "raf") {
+            stressClock.attachRAF();
+        } else {
+            stressClock.attachFixed(4, {maxSubSteps: 4});
+        }
+        $stressDrv.textContent = stressDriver === "raf" ? "rAF" : "fixed 4ms";
+        $stressDrvRaf.classList.toggle("start", stressDriver === "raf");
+        $stressDrvFixed.classList.toggle("start", stressDriver === "fixed");
+    }
+
     function onStressStart() {
-        stressCompleted = 0;
         stressSpawnAll();
-        stressClock.attachRAF();
         stressRunning = true;
+        applyStressDriver();
         stressPrevTicks = stressClock.ticks;
         stressHasMemoryApi = (typeof performance.memory === "object" && performance.memory !== null);
         if (stressHasMemoryApi) {
@@ -1514,6 +1747,227 @@
 
     $stressStart.addEventListener("click", onStressStart);
     $stressStop.addEventListener("click", onStressStop);
+    // Driver toggle: detach + re-attach the chosen driver (applyStressDriver
+    // calls attach*, and each attach replaces any prior attach).
+    $stressDrvRaf.addEventListener("click", () => {
+        stressDriver = "raf";
+        applyStressDriver();
+    });
+    $stressDrvFixed.addEventListener("click", () => {
+        stressDriver = "fixed";
+        applyStressDriver();
+    });
+
+    // ===========================================================================
+    // SCENE 5: SNAPSHOT / ROLLBACK
+    // ===========================================================================
+    const RB_LANE_COUNT = 4;
+    const RB_DURATIONS = [800, 1600, 1000, 1400];
+    const RB_LOOP_IDX = 2;        // { loop: true }
+    const RB_PINGPONG_IDX = 3;    // { pingPong: true }
+    const RB_BAR_X = 100;
+    const RB_BAR_W = 540;
+    const RB_ROW_H = 48;
+    const RB_ROW_Y0 = 24;
+
+    const $svgRollback = document.getElementById("svg-rollback");
+    const $rbPlay = document.getElementById("rb-play");
+    const $rbPause = document.getElementById("rb-pause");
+    const $rbCapture = document.getElementById("rb-capture");
+    const $rbRollback = document.getElementById("rb-rollback");
+    const $rbBench = document.getElementById("rb-bench");
+    const $rbSize = document.getElementById("rb-size");
+    const $rbCaptime = document.getElementById("rb-captime");
+    const $rbDropped = document.getElementById("rb-dropped");
+    const $rbSim = document.getElementById("rb-sim");
+    const $rbBenchMean = document.getElementById("rb-bench-mean");
+    const $rbBenchOps = document.getElementById("rb-bench-ops");
+
+    const rbClock = createClock();
+    const rbLanes = new Array(RB_LANE_COUNT);
+    const rbRowGroups = new Array(RB_LANE_COUNT);
+    const rbFillRects = new Array(RB_LANE_COUNT);
+    const rbLabels = new Array(RB_LANE_COUNT);
+    const rbCycles = new Array(RB_LANE_COUNT);   // loop/pingPong cycles + one-shot completions
+    // ONE snapshot buffer, sized to the CURRENT capacity, allocated at scene init.
+    // snapshot(rbBuf) never allocates and never views rbBuf, so it is reused as-is.
+    const rbBuf = new Uint8Array(rbClock.snapshotSize());
+    const rbStatsSink = {
+        poolUsed: 0, poolFree: 0, peakActive: 0, totalTicks: 0,
+        totalCompletions: 0, capacity: 0, timeScale: 0, droppedMs: 0
+    };
+    let rbFrame = 0;
+    let rbPlayed = false;
+
+    function buildRollbackSvg() {
+        for (let i = 0; i < RB_LANE_COUNT; i = (i + 1) | 0) {
+            const y = RB_ROW_Y0 + i * RB_ROW_H;
+            const g = document.createElementNS(SVG_NS, "g");
+            g.setAttribute("class", "lane-row");
+
+            const lbl = document.createElementNS(SVG_NS, "text");
+            lbl.setAttribute("x", 12);
+            lbl.setAttribute("y", y + 12);
+            lbl.setAttribute("class", "lane-label");
+            const kind = i === RB_LOOP_IDX ? " loop" : i === RB_PINGPONG_IDX ? " pingPong" : " one-shot";
+            lbl.textContent = "lane " + i + " (" + RB_DURATIONS[i] + "ms)" + kind;
+            g.appendChild(lbl);
+
+            const bg = document.createElementNS(SVG_NS, "rect");
+            bg.setAttribute("x", RB_BAR_X);
+            bg.setAttribute("y", y);
+            bg.setAttribute("width", RB_BAR_W);
+            bg.setAttribute("height", 20);
+            bg.setAttribute("class", "lane-bg");
+            g.appendChild(bg);
+
+            const fill = document.createElementNS(SVG_NS, "rect");
+            fill.setAttribute("x", RB_BAR_X);
+            fill.setAttribute("y", y);
+            fill.setAttribute("width", 0);
+            fill.setAttribute("height", 20);
+            fill.setAttribute("class", "lane-fill");
+            g.appendChild(fill);
+
+            const meta = document.createElementNS(SVG_NS, "text");
+            meta.setAttribute("x", 690);
+            meta.setAttribute("y", y + 12);
+            meta.setAttribute("class", "lane-meta");
+            meta.textContent = "t=0.000";
+            g.appendChild(meta);
+
+            $svgRollback.appendChild(g);
+            rbRowGroups[i] = g;
+            rbFillRects[i] = fill;
+            rbLabels[i] = meta;
+        }
+    }
+
+    buildRollbackSvg();
+
+    // Lanes NEVER dispose during the scene: one-shot lanes restart() on complete
+    // (re-run in place, handle + generation stable), loop/pingPong wrap forever.
+    // A rollback window with no lane()/dispose() gives exact refire fidelity.
+    function rbBuildLanes() {
+        for (let i = 0; i < RB_LANE_COUNT; i = (i + 1) | 0) {
+            const idx = i;
+            rbCycles[i] = 0;
+            if (i === RB_LOOP_IDX || i === RB_PINGPONG_IDX) {
+                const isPing = i === RB_PINGPONG_IDX;
+                rbLanes[i] = rbClock.lane({
+                    duration: RB_DURATIONS[i],
+                    loop: !isPing,
+                    pingPong: isPing,
+                    onComplete: () => {
+                        rbCycles[idx] = (rbCycles[idx] + 1) | 0;
+                        appendLog($logRollback,
+                            '<span class="ts">' + ts() + '</span> lane <span class="hl">' + idx + '</span> ' + (isPing ? "pingPong" : "loop") + ' cycle <span class="hl">' + rbCycles[idx] + '</span>',
+                            "info");
+                    }
+                });
+            } else {
+                rbLanes[i] = rbClock.lane({
+                    duration: RB_DURATIONS[i],
+                    onComplete: () => {
+                        rbCycles[idx] = (rbCycles[idx] + 1) | 0;
+                        appendLog($logRollback,
+                            '<span class="ts">' + ts() + '</span> lane <span class="hl">' + idx + '</span> completed <span class="hl">#' + rbCycles[idx] + '</span>',
+                            "done");
+                        rbLanes[idx].restart();   // no dispose -- keeps handle stable for rollback
+                    }
+                });
+            }
+            rbLanes[i].start();
+        }
+    }
+
+    rbBuildLanes();
+    $rbSize.textContent = rbClock.snapshotSize() + " B";
+
+    // Geometry per frame; text (metas + readouts) behind the ~10Hz mask.
+    effect(() => {
+        rbClock.frame();
+        rbFrame = (rbFrame + 1) | 0;
+        const textTick = (rbFrame & TEXT_UPDATE_MASK) === 0;
+        for (let i = 0; i < RB_LANE_COUNT; i = (i + 1) | 0) {
+            const ln = rbLanes[i];
+            const t = ln.tPeek();
+            rbFillRects[i].setAttribute("width", (t * RB_BAR_W) | 0);
+            const grp = rbRowGroups[i];
+            if (ln.donePeek()) {
+                if (grp.className.baseVal !== "lane-row done") grp.setAttribute("class", "lane-row done");
+            } else {
+                if (grp.className.baseVal !== "lane-row") grp.setAttribute("class", "lane-row");
+            }
+            if (textTick) rbLabels[i].textContent = "t=" + t.toFixed(3);
+        }
+        if (textTick) {
+            rbClock.stats(rbStatsSink);
+            $rbSim.textContent = rbClock.simTime.toFixed(2) + " ms";
+            $rbDropped.textContent = rbStatsSink.droppedMs.toFixed(1) + " ms";
+        }
+    });
+
+    $rbPlay.addEventListener("click", () => {
+        rbClock.attachFixed(8);
+        if (!rbPlayed) {
+            rbPlayed = true;
+            $rbCapture.disabled = false;
+        }
+        appendLog($logRollback, '<span class="ts">' + ts() + '</span> attachFixed(8) -- fixed 8ms driver', "info");
+    });
+    $rbPause.addEventListener("click", () => {
+        rbClock.detach();
+        appendLog($logRollback, '<span class="ts">' + ts() + '</span> detach() -- paused', "warn");
+    });
+    // Click path (not mid-tick): snapshot is legal + zero-alloc. toFixed is fine here.
+    $rbCapture.addEventListener("click", () => {
+        const t0 = performance.now();
+        const bytes = rbClock.snapshot(rbBuf);
+        const us = (performance.now() - t0) * 1000;
+        $rbRollback.disabled = false;
+        $rbCaptime.textContent = us.toFixed(2) + " us";
+        appendLog($logRollback,
+            '<span class="ts">' + ts() + '</span> CAPTURE -> <span class="hl">' + bytes + '</span> B at simTime=' + rbClock.simTime.toFixed(2) + ' (' + us.toFixed(2) + ' us)',
+            "done");
+    });
+    $rbRollback.addEventListener("click", () => {
+        rbClock.hydrate(rbBuf);
+        appendLog($logRollback,
+            '<span class="ts">' + ts() + '</span> ROLLBACK -> hydrate() to simTime=' + rbClock.simTime.toFixed(2) + ' -- completions below are <span class="hl">REFIRES</span>',
+            "info");
+    });
+
+    // Scene 5 micro-benchmark: mirror of bench cell 8 (cap-1024, 200 lanes).
+    let benchClock = null;
+    let benchBuf = null;
+    const BENCH_LOOP = 50;
+    const BENCH_LONG = 150;
+    const BENCH_WARMUP = 1000;
+    const BENCH_ITERS = 50000;
+
+    function rbBuildBench() {
+        benchClock = createClock({capacity: 1024});
+        for (let i = 0; i < BENCH_LOOP; i = (i + 1) | 0) benchClock.lane({duration: 1, loop: true}).start();
+        for (let i = 0; i < BENCH_LONG; i = (i + 1) | 0) benchClock.lane({duration: 4000}).start();
+        benchClock.advance(0.5);
+        benchBuf = new Uint8Array(benchClock.snapshotSize());
+    }
+
+    $rbBench.addEventListener("click", () => {
+        if (benchClock === null) rbBuildBench();
+        for (let i = 0; i < BENCH_WARMUP; i = (i + 1) | 0) benchClock.snapshot(benchBuf);
+        const t0 = performance.now();
+        for (let i = 0; i < BENCH_ITERS; i = (i + 1) | 0) benchClock.snapshot(benchBuf);
+        const totalMs = performance.now() - t0;
+        const meanUs = (totalMs * 1000) / BENCH_ITERS;
+        const opsPerSec = (BENCH_ITERS / (totalMs / 1000)) | 0;
+        $rbBenchMean.textContent = meanUs.toFixed(4) + " us/op";
+        $rbBenchOps.textContent = opsPerSec.toLocaleString() + " ops/s";
+        appendLog($logRollback,
+            '<span class="ts">' + ts() + '</span> BENCH ' + BENCH_ITERS.toLocaleString() + ' x snapshot(cap 1024, 200 lanes) -> <span class="hl">' + meanUs.toFixed(4) + '</span> us/op, ' + opsPerSec.toLocaleString() + ' ops/s',
+            "info");
+    });
 </script>
 
 </body>

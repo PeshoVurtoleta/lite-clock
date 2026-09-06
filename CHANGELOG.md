@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## 1.4.1 -- 2026-09-06
+
+Docs, demo, and provenance release. No runtime behavior change: outside
+README.md, llms.txt, CHANGELOG.md, demo/, test/, and bench/, the diff against
+1.4.0 is empty beyond the version strings the release bump owns (package.json
+version, the Clock.js header comment, the VERSION const, the llms.txt version
+line). Valid 1.4.0 programs behave identically.
+
+### Added
+
+- **Docs-drift guard** (`test/20-docs-drift.test.mjs`): reflectively enumerates
+  the live surface -- instance keys (private `_`-prefixed hooks filtered),
+  lane-prototype members, and the module's callable exports -- and asserts in
+  both directions that README.md and llms.txt document exactly that surface.
+  Also checks three-place version equality (package.json / VERSION / the
+  llms.txt version line) and that every relative link in README.md and llms.txt
+  resolves on disk. No hardcoded member lists or counts, so it cannot rot the
+  way the docs did.
+- **Bench provenance stamp**: `bench/bench.mjs` prints one startup line --
+  package name and version (read from package.json at runtime), `process.version`,
+  and `<platform>-<arch>` -- retiring the hardcoded `1.0.0` header. Every README
+  benchmark number is quoted under a verbatim copy of this stamp.
+- **README**: an inline `npm install` command, a paste-runnable node
+  quick-start, a `### Contract constants` table (DEFAULT_CAPACITY, MAX_LANES,
+  SNAP_FORMAT, SNAP_HEADER_BYTES, SNAP_BYTES_PER_LANE), a design-decisions
+  section linking `decisions/0001..0004`, and a full end-to-end composability
+  pipeline (statechart entry -> lane -> ease -> DOM write -> snapshot capture).
+- **Demo scene 5, "rollback"**: a fixed-timestep lane set (loop lanes included)
+  captured into ONE buffer preallocated at `snapshotSize()` on scene init and
+  hydrated back, with an in-demo snapshot micro-benchmark (200 lanes at capacity
+  1024, mean us/op + ops/s) mirroring bench cell 8.
+
+### Changed
+
+- **README restructured to the LiteSepforge blueprint spine** -- structure only;
+  every corrected contract sentence from earlier releases was moved verbatim,
+  no prose rewritten.
+- **Demo scenes 1/3/4 modernized to the 1.3/1.4 surface**: a timeScale slider,
+  a PLAY FIXED (`attachFixed`) driver with a tick-source readout, loop/pingPong
+  lanes, a seek scrubber, `lane.restart()` in place of dispose/respawn, a single
+  `stats(sink)` telemetry fill, a `droppedMs` tile, and a RAF/FIXED driver
+  toggle.
+- **Demo hot-path text updates throttled to frame-counter masks** (~10Hz) per
+  the demo-audit law; per-frame geometry (bar widths, integer setAttribute)
+  stays per-frame.
+- llms.txt Files list extended to `test/01..20`.
+
+### Testing
+
+- Suite: 193 tests, 189 run everywhere, 4 gc-gated -- the six added over 1.4.0
+  are the docs-drift guard. `node --expose-gc test/torture.mjs` is unchanged and
+  green.
+
+### Notes
+
+- History mapping gap: 1.0.1 and 1.0.2 predate the per-version commit
+  convention and have no dedicated commits (1.1.0..1.4.0 map to 232a4e5,
+  ecfc7c5, d4a4b43, a0a1597); the 1.0.1/1.0.2 entries below were verified
+  against the code, not a tagged commit.
+
+---
+
 ## 1.4.0 -- 2026-09-06
 
 The determinism keystone: binary state capture/restore (`snapshotSize` /

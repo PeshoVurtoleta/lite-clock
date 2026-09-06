@@ -21,6 +21,7 @@
 //   - Negative retention is normal (V8 reclaims warm-up working set during the
 //     measured window).
 
+import { readFileSync } from "node:fs";
 import { createClock } from "../Clock.js";
 import { effect } from "@zakkster/lite-signal";
 
@@ -65,7 +66,15 @@ function measure(name, opsPerIter, iter, fn) {
     );
 }
 
-console.log("\n@zakkster/lite-clock 1.0.0 -- bench (node --expose-gc)\n");
+const PKG_VERSION = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url))
+).version;
+console.log(
+    "\n@zakkster/lite-clock " + PKG_VERSION +
+    " | node " + process.version +
+    " | " + process.platform + "-" + process.arch +
+    " | bench (--expose-gc)\n"
+);
 
 // ---------------------------------------------------------------------------
 // 1. idle-advance: clock with no active lanes
